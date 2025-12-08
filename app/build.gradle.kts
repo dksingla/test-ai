@@ -44,8 +44,8 @@ dependencies {
     implementation(libs.navigation.fragment)
     implementation(libs.navigation.ui)
     
-    // ML Kit GenAI Prompt API
-    implementation("com.google.mlkit:genai-prompt:1.0.0-alpha1")
+    // ONNX Runtime Mobile for offline ML inference
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.17.1")
     
     // Retrofit for API calls
     implementation("com.squareup.retrofit2:retrofit:2.9.0")
