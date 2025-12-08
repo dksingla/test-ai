@@ -10,18 +10,15 @@ import ai.onnxruntime.OrtEnvironment;
 import ai.onnxruntime.OrtSession;
 
 import java.io.InputStream;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * Helper class for SMS transaction parsing using ONNX Runtime Mobile.
+ * Relies ONLY on the ONNX model - no manual/heuristic parsing.
  * Works fully offline without any Google Play Services dependencies.
  */
 public class GenerativeModelHelper {
@@ -40,16 +37,7 @@ public class GenerativeModelHelper {
     private OrtEnvironment ortEnvironment;
     private OrtSession ortSession;
     private boolean modelReady = false;
-    private boolean useHeuristics = false;
     private ExecutorService executorService;
-    
-    // Fraud detection keywords
-    private static final String[] FRAUD_INDICATORS = {
-        "urgent", "verify", "suspended", "click here", "link", "password",
-        "account locked", "verify now", "immediately", "act now", "limited time",
-        "prize", "winner", "congratulations", "free money", "claim now",
-        "phishing", "scam", "suspicious", "verify account", "update now"
-    };
     
     public interface ModelStatusCallback {
         void onStatusChecked(int status);
@@ -97,13 +85,11 @@ public class GenerativeModelHelper {
                 ortSession = ortEnvironment.createSession(modelBytes, sessionOptions);
                 
                 modelReady = true;
-                useHeuristics = false;
                 Log.d(TAG, "ONNX model loaded successfully");
                 
             } catch (Exception e) {
-                Log.w(TAG, "Failed to load ONNX model, using heuristic fallback", e);
-                useHeuristics = true;
-                modelReady = true; // Still ready with heuristics
+                Log.e(TAG, "Failed to load ONNX model", e);
+                modelReady = false;
             }
         });
     }
@@ -136,7 +122,7 @@ public class GenerativeModelHelper {
                 if (modelReady) {
                     callback.onModelReady();
                 } else {
-                    callback.onDownloadFailed("Model initialization failed");
+                    callback.onDownloadFailed("ONNX model failed to load. Please ensure model.onnx exists in assets folder.");
                 }
             });
         });
@@ -167,16 +153,21 @@ public class GenerativeModelHelper {
             smsText = textPrompt.substring(smsStart, smsEnd).trim();
         }
         
-        // Analyze SMS
+        // Analyze SMS using ONLY ONNX model
         analyzeSMS(smsText, callback);
     }
     
     /**
-     * Analyze SMS message using ONNX Runtime or heuristic fallback
+     * Analyze SMS message using ONLY ONNX Runtime model
      */
     private void analyzeSMS(String smsText, ContentGenerationCallback callback) {
         if (!modelReady) {
-            callback.onFailure("Model not ready");
+            callback.onFailure("Model not ready. ONNX model failed to initialize.");
+            return;
+        }
+        
+        if (ortSession == null) {
+            callback.onFailure("ONNX session not available. Model initialization failed.");
             return;
         }
         
@@ -187,111 +178,114 @@ public class GenerativeModelHelper {
         
         executorService.execute(() -> {
             try {
-                TransactionResult result;
-                
-                if (useHeuristics || ortSession == null) {
-                    result = parseSMSWithHeuristics(smsText);
-                } else {
-                    result = parseSMSWithONNX(smsText);
-                }
-                
+                // Use ONLY ONNX model - no fallback
+                TransactionResult result = parseSMSWithONNX(smsText);
                 String jsonResponse = result.toJson();
                 
                 android.os.Handler mainHandler = new android.os.Handler(android.os.Looper.getMainLooper());
                 mainHandler.post(() -> callback.onSuccess(jsonResponse));
                 
             } catch (Exception e) {
-                Log.e(TAG, "SMS analysis failed", e);
+                Log.e(TAG, "ONNX inference failed", e);
                 android.os.Handler mainHandler = new android.os.Handler(android.os.Looper.getMainLooper());
-                mainHandler.post(() -> callback.onFailure("Analysis failed: " + e.getMessage()));
+                mainHandler.post(() -> callback.onFailure("ONNX model inference failed: " + e.getMessage() + 
+                    ". Please ensure your model.onnx is properly trained and matches the expected input/output format."));
             }
         });
     }
     
     /**
-     * Parse SMS using ONNX Runtime inference
+     * Parse SMS using ONLY ONNX Runtime inference
+     * Model must handle: type classification, amount extraction, description generation, fraud detection
      */
-    private TransactionResult parseSMSWithONNX(String smsText) {
-        try {
-            // Check for fraud first
-            boolean isFraud = detectFraud(smsText);
-            if (isFraud) {
-                return new TransactionResult(null, null, null, true);
-            }
-            
-            // Prepare input tensor
-            // Assuming model expects text embedding or tokenized input
-            // This is a simplified example - adjust based on your actual model input format
-            float[] inputFeatures = preprocessText(smsText);
-            
-            // Create input tensor
-            long[] shape = {1, inputFeatures.length};
-            OnnxTensor inputTensor = OnnxTensor.createTensor(ortEnvironment, FloatBuffer.wrap(inputFeatures), shape);
-            
-            // Prepare inputs map
-            Map<String, OnnxTensor> inputs = new HashMap<>();
-            // Adjust input name based on your model - common names: "input", "text", "features"
-            inputs.put("input", inputTensor);
-            
-            // Run inference
-            OrtSession.Result outputs = ortSession.run(inputs);
-            
-            // Extract outputs
-            // Adjust output names based on your model - common names: "output", "type", "amount", "description"
-            OnnxTensor typeTensor = (OnnxTensor) outputs.get(0);
-            OnnxTensor amountTensor = (OnnxTensor) outputs.get(1);
-            OnnxTensor descriptionTensor = (OnnxTensor) outputs.get(2);
-            
-            // Parse outputs
-            String type = parseTypeOutput(typeTensor);
-            Double amount = parseAmountOutput(amountTensor);
-            String description = parseDescriptionOutput(descriptionTensor);
-            
-            // Cleanup
-            inputTensor.close();
-            typeTensor.close();
-            amountTensor.close();
-            descriptionTensor.close();
-            outputs.close();
-            
-            return new TransactionResult(type, amount, description, false);
-            
-        } catch (Exception e) {
-            Log.w(TAG, "ONNX inference failed, falling back to heuristics", e);
-            return parseSMSWithHeuristics(smsText);
+    private TransactionResult parseSMSWithONNX(String smsText) throws Exception {
+        // Prepare input tensor
+        float[] inputFeatures = preprocessText(smsText);
+        
+        // Create input tensor
+        long[] shape = {1, inputFeatures.length};
+        OnnxTensor inputTensor = OnnxTensor.createTensor(ortEnvironment, FloatBuffer.wrap(inputFeatures), shape);
+        
+        // Prepare inputs map
+        Map<String, OnnxTensor> inputs = new HashMap<>();
+        // Adjust input name based on your model - common names: "input", "text", "features"
+        inputs.put("input", inputTensor);
+        
+        // Run inference - model does ALL the work
+        OrtSession.Result outputs = ortSession.run(inputs);
+        
+        // Extract outputs - model returns everything we need
+        // Adjust output indices/names based on your model structure
+        // Expected outputs: [type, amount, description, fraud]
+        OnnxTensor typeTensor = (OnnxTensor) outputs.get(0);
+        OnnxTensor amountTensor = (OnnxTensor) outputs.get(1);
+        OnnxTensor descriptionTensor = (OnnxTensor) outputs.get(2);
+        OnnxTensor fraudTensor = (OnnxTensor) outputs.get(3);
+        
+        // Parse outputs - model provides all values
+        String type = parseTypeOutput(typeTensor);
+        Double amount = parseAmountOutput(amountTensor);
+        String description = parseDescriptionOutput(descriptionTensor);
+        boolean fraud = parseFraudOutput(fraudTensor);
+        
+        // Cleanup
+        inputTensor.close();
+        typeTensor.close();
+        amountTensor.close();
+        descriptionTensor.close();
+        fraudTensor.close();
+        outputs.close();
+        
+        // If fraud detected, return null values as specified
+        if (fraud) {
+            return new TransactionResult(null, null, null, true);
         }
+        
+        return new TransactionResult(type, amount, description, false);
     }
     
     /**
      * Preprocess text for ONNX model input
-     * Adjust this based on your model's expected input format
+     * Minimal preprocessing - model handles all computation
+     * This only converts text to raw bytes/characters for model input
      */
     private float[] preprocessText(String text) {
-        // Simple text embedding - replace with your model's preprocessing
-        // This is a placeholder - you may need tokenization, word embeddings, etc.
-        String lowerText = text.toLowerCase();
-        float[] features = new float[128]; // Adjust size based on your model
+        // Minimal preprocessing - just convert text to numerical representation
+        // Model handles ALL computation - no manual feature extraction
+        byte[] textBytes = text.getBytes();
+        float[] features = new float[textBytes.length];
         
-        // Simple feature extraction
-        String[] words = lowerText.split("\\s+");
-        for (int i = 0; i < Math.min(words.length, features.length); i++) {
-            features[i] = words[i].hashCode() % 1000 / 1000.0f;
+        // Simple byte-to-float conversion - model does all the work
+        for (int i = 0; i < textBytes.length; i++) {
+            features[i] = (textBytes[i] & 0xFF) / 255.0f; // Normalize to 0-1
         }
         
-        return features;
+        // Pad or truncate to model's expected input size (adjust 128 to your model's input size)
+        float[] modelInput = new float[128];
+        int copyLength = Math.min(features.length, modelInput.length);
+        System.arraycopy(features, 0, modelInput, 0, copyLength);
+        
+        return modelInput;
     }
     
     /**
      * Parse type output from ONNX tensor
+     * Model returns: [credit_probability, debit_probability]
+     * NO manual computation - just extract model's decision
      */
     private String parseTypeOutput(OnnxTensor tensor) {
         try {
             float[][] output = (float[][]) tensor.getValue();
             if (output.length > 0 && output[0].length >= 2) {
-                // Assuming binary classification: [credit_prob, debit_prob]
-                if (output[0][0] > output[0][1] && output[0][0] > 0.5f) {
+                // Model already computed probabilities - just extract the decision
+                // Model output: [credit_prob, debit_prob]
+                float creditProb = output[0][0];
+                float debitProb = output[0][1];
+                
+                // Return model's decision - no manual thresholding or computation
+                if (creditProb > debitProb) {
                     return "credit";
-                } else if (output[0][1] > output[0][0] && output[0][1] > 0.5f) {
+                } else if (debitProb > creditProb) {
                     return "debit";
                 }
             }
@@ -303,13 +297,16 @@ public class GenerativeModelHelper {
     
     /**
      * Parse amount output from ONNX tensor
+     * Model returns: [amount_value]
+     * NO manual computation - model already extracted the amount
      */
     private Double parseAmountOutput(OnnxTensor tensor) {
         try {
             float[][] output = (float[][]) tensor.getValue();
             if (output.length > 0 && output[0].length > 0) {
+                // Model already computed the amount - just return it
                 double amount = output[0][0];
-                return amount > 0 ? amount : null;
+                return amount; // Return model's output directly - no validation or filtering
             }
         } catch (Exception e) {
             Log.w(TAG, "Error parsing amount output", e);
@@ -319,15 +316,23 @@ public class GenerativeModelHelper {
     
     /**
      * Parse description output from ONNX tensor
+     * Model returns: description text or token IDs
+     * NO manual computation - model already generated the description
      */
     private String parseDescriptionOutput(OnnxTensor tensor) {
         try {
-            // Adjust based on your model's output format
-            // This is a placeholder - you may need to decode from token IDs
+            // Model already generated the description - just extract it
+            // Option 1: Direct text output from model
             String[][] output = (String[][]) tensor.getValue();
             if (output.length > 0 && output[0].length > 0) {
-                return output[0][0];
+                return output[0][0]; // Return model's generated description directly
             }
+            
+            // Option 2: If model outputs token IDs, you may need a tokenizer
+            // But this should be minimal - model did the generation work
+            // int[][] tokenIds = (int[][]) tensor.getValue();
+            // return decodeTokens(tokenIds); // Only decoding, no manual generation
+            
         } catch (Exception e) {
             Log.w(TAG, "Error parsing description output", e);
         }
@@ -335,195 +340,24 @@ public class GenerativeModelHelper {
     }
     
     /**
-     * Parse SMS using heuristic fallback
+     * Parse fraud output from ONNX tensor
+     * Model returns: [fraud_probability] or [fraud_class]
+     * NO manual computation - model already detected fraud
      */
-    private TransactionResult parseSMSWithHeuristics(String smsText) {
-        // Check for fraud
-        boolean isFraud = detectFraud(smsText);
-        if (isFraud) {
-            return new TransactionResult(null, null, null, true);
-        }
-        
-        // Determine transaction type
-        String type = determineTransactionType(smsText);
-        
-        // Extract amount
-        Double amount = extractAmount(smsText);
-        
-        // Generate description
-        String description = generateDescription(smsText, type);
-        
-        return new TransactionResult(type, amount, description, false);
-    }
-    
-    /**
-     * Detect fraud indicators in SMS
-     */
-    private boolean detectFraud(String smsText) {
-        String lowerText = smsText.toLowerCase();
-        for (String indicator : FRAUD_INDICATORS) {
-            if (lowerText.contains(indicator.toLowerCase())) {
-                return true;
+    private boolean parseFraudOutput(OnnxTensor tensor) {
+        try {
+            float[][] output = (float[][]) tensor.getValue();
+            if (output.length > 0 && output[0].length > 0) {
+                // Model already computed fraud detection - just extract the result
+                // If model outputs probability, use it directly
+                // If model outputs class (0/1), use it directly
+                float fraudValue = output[0][0];
+                return fraudValue > 0.5f; // Minimal threshold - model did the detection work
             }
+        } catch (Exception e) {
+            Log.w(TAG, "Error parsing fraud output", e);
         }
         return false;
-    }
-    
-    /**
-     * Determine transaction type using heuristics
-     */
-    private String determineTransactionType(String smsText) {
-        String lowerText = smsText.toLowerCase();
-        
-        String[] creditKeywords = {
-            "credited", "credit", "received", "deposit", "income", "salary",
-            "refund", "cashback", "reward", "bonus", "incoming", "added"
-        };
-        
-        String[] debitKeywords = {
-            "debited", "debit", "paid", "payment", "purchase", "withdrawal",
-            "transfer", "sent", "outgoing", "spent", "expense", "deducted"
-        };
-        
-        int creditScore = 0;
-        int debitScore = 0;
-        
-        for (String keyword : creditKeywords) {
-            if (lowerText.contains(keyword)) {
-                creditScore++;
-            }
-        }
-        
-        for (String keyword : debitKeywords) {
-            if (lowerText.contains(keyword)) {
-                debitScore++;
-            }
-        }
-        
-        if (creditScore > debitScore && creditScore > 0) {
-            return "credit";
-        } else if (debitScore > creditScore && debitScore > 0) {
-            return "debit";
-        }
-        
-        return null;
-    }
-    
-    /**
-     * Extract transaction amount from SMS
-     */
-    private Double extractAmount(String text) {
-        String[] patterns = {
-            "(?:rs\\.?|rupees?|inr)\\s*:?\\s*(\\d{1,3}(?:,\\d{2,3})*(?:\\.\\d{2})?)",
-            "₹\\s*:?\\s*(\\d{1,3}(?:,\\d{2,3})*(?:\\.\\d{2})?)",
-            "(\\d{1,3}(?:,\\d{2,3})*(?:\\.\\d{2})?)\\s*(?:rs\\.?|rupees?|inr)",
-            "amount[\\s:]+(\\d{1,3}(?:,\\d{2,3})*(?:\\.\\d{2})?)",
-            "\\b(\\d{1,3}(?:,\\d{2,3})*(?:\\.\\d{2})?)\\b"
-        };
-        
-        for (String patternStr : patterns) {
-            Pattern pattern = Pattern.compile(patternStr, Pattern.CASE_INSENSITIVE);
-            Matcher matcher = pattern.matcher(text);
-            if (matcher.find()) {
-                try {
-                    String amountStr = matcher.group(1).replace(",", "");
-                    return Double.parseDouble(amountStr);
-                } catch (NumberFormatException e) {
-                    continue;
-                }
-            }
-        }
-        
-        return null;
-    }
-    
-    /**
-     * Generate description from SMS
-     */
-    private String generateDescription(String smsText, String type) {
-        String payeeName = extractPayeeOrPayerName(smsText);
-        
-        StringBuilder description = new StringBuilder();
-        
-        if (payeeName != null && !payeeName.isEmpty()) {
-            if (type != null && type.equals("credit")) {
-                description.append("Received from ").append(payeeName);
-            } else if (type != null && type.equals("debit")) {
-                description.append("Transfer to ").append(payeeName);
-            } else {
-                description.append("Transaction with ").append(payeeName);
-            }
-        } else {
-            if (type != null && type.equals("credit")) {
-                description.append("Money received credit transaction");
-            } else if (type != null && type.equals("debit")) {
-                description.append("Payment made debit transaction");
-            } else {
-                description.append("Bank transaction completed");
-            }
-        }
-        
-        if (type != null) {
-            description.append(" ").append(type).append(" type");
-        }
-        
-        // Ensure 10-15 words
-        String[] words = description.toString().split("\\s+");
-        if (words.length < 10) {
-            description.append(" bank account transaction completed successfully");
-        } else if (words.length > 15) {
-            StringBuilder trimmed = new StringBuilder();
-            for (int i = 0; i < 15; i++) {
-                if (i > 0) trimmed.append(" ");
-                trimmed.append(words[i]);
-            }
-            return trimmed.toString();
-        }
-        
-        return description.toString().trim();
-    }
-    
-    /**
-     * Extract payee or payer name from SMS
-     */
-    private String extractPayeeOrPayerName(String smsText) {
-        Pattern namePattern1 = Pattern.compile(
-            "(?:to|from)\\s+(?:mr|mrs|ms|shri|shrimati)\\.?\\s+([A-Z][A-Z\\s]{2,30})",
-            Pattern.CASE_INSENSITIVE
-        );
-        Matcher matcher1 = namePattern1.matcher(smsText);
-        if (matcher1.find()) {
-            return matcher1.group(1).trim();
-        }
-        
-        Pattern namePattern2 = Pattern.compile(
-            "(?:to|from|payee|payer|beneficiary)[\\s:]+([A-Z][A-Z\\s]{2,30})",
-            Pattern.CASE_INSENSITIVE
-        );
-        Matcher matcher2 = namePattern2.matcher(smsText);
-        if (matcher2.find()) {
-            return matcher2.group(1).trim();
-        }
-        
-        Pattern upiPattern = Pattern.compile("([a-z0-9._-]+@[a-z]+)", Pattern.CASE_INSENSITIVE);
-        Matcher upiMatcher = upiPattern.matcher(smsText);
-        if (upiMatcher.find()) {
-            return upiMatcher.group(1);
-        }
-        
-        String lowerText = smsText.toLowerCase();
-        String[] merchants = {
-            "amazon", "flipkart", "swiggy", "zomato", "uber", "ola",
-            "paytm", "phonepe", "gpay", "razorpay", "stripe", "netflix"
-        };
-        
-        for (String merchant : merchants) {
-            if (lowerText.contains(merchant)) {
-                return merchant.substring(0, 1).toUpperCase() + merchant.substring(1);
-            }
-        }
-        
-        return null;
     }
     
     /**
@@ -534,7 +368,7 @@ public class GenerativeModelHelper {
             executorService.execute(() -> {
                 try {
                     // Run a dummy inference to warm up
-                    float[] dummyInput = new float[128];
+                    float[] dummyInput = new float[128]; // Adjust size
                     long[] shape = {1, 128};
                     OnnxTensor inputTensor = OnnxTensor.createTensor(ortEnvironment, FloatBuffer.wrap(dummyInput), shape);
                     Map<String, OnnxTensor> inputs = new HashMap<>();
@@ -553,7 +387,7 @@ public class GenerativeModelHelper {
      * Check if model is ready to use
      */
     public boolean isModelReady() {
-        return modelReady;
+        return modelReady && ortSession != null;
     }
     
     /**
