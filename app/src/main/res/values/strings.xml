@@ -1,0 +1,28 @@
+<resources>
+    <string name="app_name">Expense Tracker</string>
+    <string name="title_home">Home</string>
+    <string name="title_dashboard">Dashboard</string>
+    <string name="title_notifications">Notifications</string>
+    
+    <!-- Login Screen -->
+    <string name="login_title">Log in</string>
+    <string name="email_hint">Email address</string>
+    <string name="send_otp">Send OTP</string>
+    <string name="sending">Sending…</string>
+    <string name="sign_up_prompt">Don\'t have an account? </string>
+    <string name="sign_up">Sign up</string>
+    
+    <!-- Signup Screen -->
+    <string name="signup_title">Sign up</string>
+    <string name="name_hint">Name</string>
+    <string name="signing_up">Signing up…</string>
+    <string name="login_prompt">Already have an account? </string>
+    <string name="log_in">Log in</string>
+    
+    <!-- SMS Analysis Test -->
+    <string name="sms_hint">Paste SMS transaction message</string>
+    <string name="analyze_sms">Analyze SMS</string>
+    <string name="amount_label">Amount:</string>
+    <string name="type_label">Type:</string>
+    <string name="description_label">Description:</string>
+</resources>
