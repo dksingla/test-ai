@@ -183,13 +183,15 @@ public class GenerativeModelHelper {
             Log.d(TAG, "🔍 TFLITE_MODEL: Preprocessed sequence length: " + inputSequence.length);
             
             // Prepare input/output buffers
-            // Input should be int32 (token IDs) since the model has an Embedding layer
-            int[][] inputBuffer = new int[1][MAX_SEQUENCE_LENGTH];
+            // Model expects FLOAT32 input, not INT32
+            float[][] inputBuffer = new float[1][MAX_SEQUENCE_LENGTH];
             float[][] typeOutput = new float[1][1];
             float[][] amountOutput = new float[1][1];
             
-            // Copy sequence to input buffer
-            System.arraycopy(inputSequence, 0, inputBuffer[0], 0, Math.min(inputSequence.length, MAX_SEQUENCE_LENGTH));
+            // Copy sequence to input buffer, converting int to float
+            for (int i = 0; i < Math.min(inputSequence.length, MAX_SEQUENCE_LENGTH); i++) {
+                inputBuffer[0][i] = (float) inputSequence[i];
+            }
             
             // Run inference
             Map<Integer, Object> outputs = new HashMap<>();
@@ -322,7 +324,8 @@ public class GenerativeModelHelper {
             Log.d(TAG, "🔍 TFLITE_MODEL: Warming up model...");
             try {
                 // Run a dummy inference to warm up
-                int[][] dummyInput = new int[1][MAX_SEQUENCE_LENGTH];
+                // Use FLOAT32 to match model input type
+                float[][] dummyInput = new float[1][MAX_SEQUENCE_LENGTH];
                 float[][] dummyTypeOutput = new float[1][1];
                 float[][] dummyAmountOutput = new float[1][1];
                 
