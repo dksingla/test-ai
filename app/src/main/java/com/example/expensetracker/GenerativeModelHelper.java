@@ -1,44 +1,34 @@
 package com.example.expensetracker;
 
 import android.content.Context;
-import android.content.res.AssetManager;
-import android.graphics.Bitmap;
 import android.util.Log;
+
+import androidx.core.content.ContextCompat;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.FloatBuffer;
+import java.util.concurrent.Executor;
 
 import ai.onnxruntime.OnnxTensor;
 import ai.onnxruntime.OrtEnvironment;
+import ai.onnxruntime.OrtException;
 import ai.onnxruntime.OrtSession;
 
-import java.io.InputStream;
-import java.nio.FloatBuffer;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-
 /**
- * Helper class for SMS transaction parsing using ONNX Runtime Mobile.
- * Relies ONLY on the ONNX model - no manual/heuristic parsing.
- * Works fully offline without any Google Play Services dependencies.
+ * ONNX helper: loads two ONNX models (type + fraud) and runs inference.
+ *
+ * Requirement: assets/model_type.onnx and assets/model_fraud.onnx
  */
 public class GenerativeModelHelper {
     private static final String TAG = "GenerativeModelHelper";
-    
-    // Feature status constants
-    private static final int FEATURE_STATUS_AVAILABLE = 1;
-    private static final int FEATURE_STATUS_UNAVAILABLE = 2;
-    private static final int FEATURE_STATUS_DOWNLOADING = 3;
-    private static final int FEATURE_STATUS_DOWNLOADABLE = 4;
-    
-    // Model file path
-    private static final String MODEL_FILE = "model.onnx";
-    
-    private Context context;
-    private OrtEnvironment ortEnvironment;
-    private OrtSession ortSession;
-    private boolean modelReady = false;
-    private ExecutorService executorService;
-    
+
+    private final Context context;
+    private OrtEnvironment env;
+    private OrtSession sessionType;
+    private OrtSession sessionFraud;
+    private volatile boolean modelReady = false;
+
     public interface ModelStatusCallback {
         void onStatusChecked(int status);
         void onDownloadStarted();
@@ -47,417 +37,280 @@ public class GenerativeModelHelper {
         void onDownloadFailed(String error);
         void onModelReady();
     }
-    
+
     public interface ContentGenerationCallback {
         void onSuccess(String response);
         void onFailure(String error);
     }
-    
+
     public GenerativeModelHelper(Context context) {
         this.context = context;
-        this.executorService = Executors.newSingleThreadExecutor();
-        initializeModel();
+        initializeModels();
     }
-    
-    /**
-     * Initialize ONNX Runtime model from assets
-     */
-    private void initializeModel() {
-        executorService.execute(() -> {
+
+    private void initializeModels() {
+        Executor executor = ContextCompat.getMainExecutor(context);
+        executor.execute(() -> {
             try {
-                // Initialize ONNX Runtime environment
-                ortEnvironment = OrtEnvironment.getEnvironment();
-                
-                // Load model from assets
-                AssetManager assetManager = context.getAssets();
-                InputStream inputStream = assetManager.open(MODEL_FILE);
-                
-                // Read model bytes
-                byte[] modelBytes = new byte[inputStream.available()];
-                inputStream.read(modelBytes);
-                inputStream.close();
-                
-                // Create ONNX session
-                OrtSession.SessionOptions sessionOptions = new OrtSession.SessionOptions();
-                sessionOptions.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
-                sessionOptions.setIntraOpNumThreads(2);
-                
-                ortSession = ortEnvironment.createSession(modelBytes, sessionOptions);
-                
+                env = OrtEnvironment.getEnvironment();
+
+                byte[] modelTypeBytes = loadAssetBytes("model_type.onnx");
+                sessionType = env.createSession(modelTypeBytes);
+
+                byte[] modelFraudBytes = loadAssetBytes("model_fraud.onnx");
+                sessionFraud = env.createSession(modelFraudBytes);
+
                 modelReady = true;
-                Log.d(TAG, "ONNX model loaded successfully");
-                
+                Log.d(TAG, "✅ ONNX models loaded");
+
             } catch (Exception e) {
-                Log.e(TAG, "Failed to load ONNX model", e);
+                Log.e(TAG, "Failed to load ONNX models", e);
                 modelReady = false;
             }
         });
     }
-    
-    /**
-     * Check and prepare model (maintains API compatibility)
-     */
+
+    private byte[] loadAssetBytes(String name) throws IOException {
+        InputStream is = context.getAssets().open(name);
+        try {
+            int size = is.available();
+            byte[] b = new byte[size];
+            int totalRead = 0;
+            while (totalRead < size) {
+                int read = is.read(b, totalRead, size - totalRead);
+                if (read == -1) break;
+                totalRead += read;
+            }
+            return b;
+        } finally {
+            is.close();
+        }
+    }
+
     public void checkAndPrepareModel(ModelStatusCallback callback) {
-        checkAICoreAvailability(callback);
+        if (modelReady) {
+            callback.onStatusChecked(1); // available
+            callback.onModelReady();
+        } else {
+            callback.onStatusChecked(2); // unavailable
+            callback.onDownloadFailed("ONNX models not loaded");
+        }
     }
-    
+
     /**
-     * Check model availability (maintains API compatibility)
+     * Main entry: send SMS text here.
+     * If model predicts 'none' type => returns nulls + fraud=true.
      */
-    public void checkAICoreAvailability(ModelStatusCallback callback) {
-        executorService.execute(() -> {
-            android.os.Handler mainHandler = new android.os.Handler(android.os.Looper.getMainLooper());
-            
-            // Wait a bit for model initialization
+    public void generateContent(String smsText, ContentGenerationCallback callback) {
+        Executor executor = ContextCompat.getMainExecutor(context);
+        executor.execute(() -> {
             try {
-                Thread.sleep(300);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-            
-            mainHandler.post(() -> {
-                callback.onStatusChecked(
-                    modelReady ? FEATURE_STATUS_AVAILABLE : FEATURE_STATUS_UNAVAILABLE
-                );
-                if (modelReady) {
-                    callback.onModelReady();
-                } else {
-                    callback.onDownloadFailed("ONNX model failed to load. Please ensure model.onnx exists in assets folder.");
+                // Compute features exactly like training script
+                float[] features = computeFeatures(smsText); // length = 6
+
+                // If models not ready -> fallback heuristics (simple)
+                if (!modelReady || sessionType == null || sessionFraud == null) {
+                    String fallback = fallbackResponseBasedOnHeuristics(smsText);
+                    callback.onSuccess(fallback);
+                    return;
                 }
-            });
-        });
-    }
-    
-    /**
-     * Generate content from text-only input
-     */
-    public void generateContent(String prompt, ContentGenerationCallback callback) {
-        generateContent(prompt, null, callback);
-    }
-    
-    /**
-     * Generate content from multimodal input (image + text)
-     * Note: Image processing not implemented, uses text only
-     */
-    public void generateContent(String textPrompt, Bitmap image, ContentGenerationCallback callback) {
-        // Extract SMS text from prompt if it contains "SMS:"
-        String smsText = textPrompt;
-        if (textPrompt.contains("SMS:")) {
-            int smsStart = textPrompt.indexOf("SMS:") + 4;
-            int smsEnd = textPrompt.length();
-            if (textPrompt.indexOf("\"", smsStart) != -1) {
-                smsStart = textPrompt.indexOf("\"", smsStart) + 1;
-                smsEnd = textPrompt.indexOf("\"", smsStart);
-                if (smsEnd == -1) smsEnd = textPrompt.length();
-            }
-            smsText = textPrompt.substring(smsStart, smsEnd).trim();
-        }
-        
-        // Analyze SMS using ONLY ONNX model
-        analyzeSMS(smsText, callback);
-    }
-    
-    /**
-     * Analyze SMS message using ONLY ONNX Runtime model
-     */
-    private void analyzeSMS(String smsText, ContentGenerationCallback callback) {
-        if (!modelReady) {
-            callback.onFailure("Model not ready. ONNX model failed to initialize.");
-            return;
-        }
-        
-        if (ortSession == null) {
-            callback.onFailure("ONNX session not available. Model initialization failed.");
-            return;
-        }
-        
-        if (smsText == null || smsText.trim().isEmpty()) {
-            callback.onFailure("SMS text is empty");
-            return;
-        }
-        
-        executorService.execute(() -> {
-            try {
-                // Use ONLY ONNX model - no fallback
-                TransactionResult result = parseSMSWithONNX(smsText);
-                String jsonResponse = result.toJson();
+
+                // Prepare tensor: shape [1, n_features]
+                long[] shape = new long[]{1, features.length};
+                FloatBuffer fb = FloatBuffer.wrap(features);
                 
-                android.os.Handler mainHandler = new android.os.Handler(android.os.Looper.getMainLooper());
-                mainHandler.post(() -> callback.onSuccess(jsonResponse));
-                
+                // RUN type model
+                String typePred = "none";
+                try (OnnxTensor inputTensor = OnnxTensor.createTensor(env, fb, shape);
+                     OrtSession.Result r = sessionType.run(java.util.Collections.singletonMap(
+                        sessionType.getInputNames().iterator().next(), inputTensor))) {
+
+                    // Most sklearn->ONNX exports produce a probability output named 'label' or array. We attempt to read first output
+                    // Get first output as float array/probs
+                    Object out0 = r.get(0).getValue();
+                    // out0 may be probability array shape [1,3] -> we handle common cases
+                    float[] probs = extractProbabilitiesFromResult(out0);
+                    int argmax = argMax(probs);
+                    if (argmax == 0) typePred = "debit";
+                    else if (argmax == 1) typePred = "credit";
+                    else typePred = "none";
+                }
+
+                // RUN fraud model -> get probability
+                float fraudProb = 0.0f;
+                fb.rewind(); // Reset buffer position for reuse
+                try (OnnxTensor inputTensor2 = OnnxTensor.createTensor(env, fb, shape);
+                     OrtSession.Result r2 = sessionFraud.run(java.util.Collections.singletonMap(
+                        sessionFraud.getInputNames().iterator().next(), inputTensor2))) {
+                    Object out0 = r2.get(0).getValue();
+                    float[] probs = extractProbabilitiesFromResult(out0);
+                    // fraud model was trained binary; pick probability of class 1 if provided, or single-score
+                    if (probs.length == 1) {
+                        fraudProb = probs[0];
+                    } else if (probs.length >= 2) {
+                        fraudProb = probs[1];
+                    }
+                }
+
+                // If type == none -> your rule: return nulls and fraud=true
+                if ("none".equals(typePred)) {
+                    String json = "{\"type\":null,\"amount\":null,\"description\":null,\"fraud\":true}";
+                    callback.onSuccess(json);
+                    return;
+                }
+
+                // Otherwise compute amount & description heuristics
+                Double amount = extractAmountHeuristic(smsText);
+                String desc = extractDescriptionHeuristic(smsText);
+
+                boolean fraud = fraudProb >= 0.5f; // threshold
+                String json = "{"
+                        + "\"type\":\"" + typePred + "\","
+                        + "\"amount\":" + (amount == null ? "null" : amount) + ","
+                        + "\"description\":" + (desc == null ? "null" : "\"" + escapeJson(desc) + "\"") + ","
+                        + "\"fraud\":" + fraud
+                        + "}";
+                callback.onSuccess(json);
+
             } catch (Exception e) {
-                Log.e(TAG, "ONNX inference failed", e);
-                android.os.Handler mainHandler = new android.os.Handler(android.os.Looper.getMainLooper());
-                mainHandler.post(() -> callback.onFailure("ONNX model inference failed: " + e.getMessage() + 
-                    ". Please ensure your model.onnx is properly trained and matches the expected input/output format."));
+                Log.e(TAG, "ONNX inference error, using fallback", e);
+                callback.onFailure("Inference failed: " + e.getMessage());
             }
         });
     }
-    
-    /**
-     * Parse SMS using ONLY ONNX Runtime inference
-     * Model must handle: type classification, amount extraction, description generation, fraud detection
-     */
-    private TransactionResult parseSMSWithONNX(String smsText) throws Exception {
-        // Prepare input tensor
-        float[] inputFeatures = preprocessText(smsText);
-        
-        // Create input tensor
-        long[] shape = {1, inputFeatures.length};
-        OnnxTensor inputTensor = OnnxTensor.createTensor(ortEnvironment, FloatBuffer.wrap(inputFeatures), shape);
-        
-        // Prepare inputs map
-        Map<String, OnnxTensor> inputs = new HashMap<>();
-        // Adjust input name based on your model - common names: "input", "text", "features"
-        inputs.put("input", inputTensor);
-        
-        // Run inference - model does ALL the work
-        OrtSession.Result outputs = ortSession.run(inputs);
-        
-        // Extract outputs - model returns everything we need
-        // Adjust output indices/names based on your model structure
-        // Expected outputs: [type, amount, description, fraud]
-        OnnxTensor typeTensor = (OnnxTensor) outputs.get(0);
-        OnnxTensor amountTensor = (OnnxTensor) outputs.get(1);
-        OnnxTensor descriptionTensor = (OnnxTensor) outputs.get(2);
-        OnnxTensor fraudTensor = (OnnxTensor) outputs.get(3);
-        
-        // Parse outputs - model provides all values
-        String type = parseTypeOutput(typeTensor);
-        Double amount = parseAmountOutput(amountTensor);
-        String description = parseDescriptionOutput(descriptionTensor);
-        boolean fraud = parseFraudOutput(fraudTensor);
-        
-        // Cleanup
-        inputTensor.close();
-        typeTensor.close();
-        amountTensor.close();
-        descriptionTensor.close();
-        fraudTensor.close();
-        outputs.close();
-        
-        // If fraud detected, return null values as specified
-        if (fraud) {
-            return new TransactionResult(null, null, null, true);
-        }
-        
-        return new TransactionResult(type, amount, description, false);
+
+    // -- Helpers --
+
+    private float[] computeFeatures(String sms) {
+        String s = sms == null ? "" : sms.toLowerCase();
+        float f0 = (s.contains("debit") || s.contains("debited") || s.contains("spent")) ? 1f : 0f;
+        float f1 = (s.contains("credit") || s.contains("credited") || s.contains("received")) ? 1f : 0f;
+        float f2 = s.contains("to ") ? 1f : 0f;
+        float f3 = s.contains("from ") ? 1f : 0f;
+        float f4 = countNumbers(s);
+        float f5 = Math.min((float)s.length(), 10000f);
+        return new float[]{f0, f1, f2, f3, f4, f5};
     }
-    
-    /**
-     * Preprocess text for ONNX model input
-     * Minimal preprocessing - model handles all computation
-     * This only converts text to raw bytes/characters for model input
-     */
-    private float[] preprocessText(String text) {
-        // Minimal preprocessing - just convert text to numerical representation
-        // Model handles ALL computation - no manual feature extraction
-        byte[] textBytes = text.getBytes();
-        float[] features = new float[textBytes.length];
-        
-        // Simple byte-to-float conversion - model does all the work
-        for (int i = 0; i < textBytes.length; i++) {
-            features[i] = (textBytes[i] & 0xFF) / 255.0f; // Normalize to 0-1
+
+    private int countNumbers(String s) {
+        int count = 0;
+        for (int i = 0; i < s.length(); ++i) {
+            if (Character.isDigit(s.charAt(i))) {
+                count++;
+                // skip sequence of digits
+                while (i + 1 < s.length() && Character.isDigit(s.charAt(i + 1))) i++;
+            }
         }
-        
-        // Pad or truncate to model's expected input size (adjust 128 to your model's input size)
-        float[] modelInput = new float[128];
-        int copyLength = Math.min(features.length, modelInput.length);
-        System.arraycopy(features, 0, modelInput, 0, copyLength);
-        
-        return modelInput;
+        return count;
     }
-    
-    /**
-     * Parse type output from ONNX tensor
-     * Model returns: [credit_probability, debit_probability]
-     * NO manual computation - just extract model's decision
-     */
-    private String parseTypeOutput(OnnxTensor tensor) {
+
+    private float[] extractProbabilitiesFromResult(Object out0) {
+        // Possible shapes:
+        // - float[][] (1 x N) -> return flatten
+        // - double[][] -> cast
+        // - float[] -> return
+        // - double[] -> cast
         try {
-            float[][] output = (float[][]) tensor.getValue();
-            if (output.length > 0 && output[0].length >= 2) {
-                // Model already computed probabilities - just extract the decision
-                // Model output: [credit_prob, debit_prob]
-                float creditProb = output[0][0];
-                float debitProb = output[0][1];
-                
-                // Return model's decision - no manual thresholding or computation
-                if (creditProb > debitProb) {
-                    return "credit";
-                } else if (debitProb > creditProb) {
-                    return "debit";
+            if (out0 instanceof float[][]) {
+                float[][] arr = (float[][]) out0;
+                return arr[0];
+            } else if (out0 instanceof double[][]) {
+                double[][] arr = (double[][]) out0;
+                double[] row = arr[0];
+                float[] out = new float[row.length];
+                for (int i = 0; i < row.length; i++) out[i] = (float) row[i];
+                return out;
+            } else if (out0 instanceof float[]) {
+                return (float[]) out0;
+            } else if (out0 instanceof double[]) {
+                double[] a = (double[]) out0;
+                float[] out = new float[a.length];
+                for (int i = 0; i < a.length; i++) out[i] = (float) a[i];
+                return out;
+            } else if (out0 instanceof java.lang.Number) {
+                return new float[]{((Number) out0).floatValue()};
+            } else {
+                // fallback: try toString parsing
+                String s = out0.toString();
+                // attempt simple parse of bracketed numbers
+                s = s.replaceAll("[\\[\\]]", "");
+                String[] parts = s.split("[,\\s]+");
+                float[] out = new float[parts.length];
+                for (int i = 0; i < parts.length; ++i) {
+                    try { out[i] = Float.parseFloat(parts[i]); } catch (Exception ex) { out[i] = 0f; }
                 }
+                return out;
             }
         } catch (Exception e) {
-            Log.w(TAG, "Error parsing type output", e);
+            Log.e(TAG, "Failed to parse model output", e);
+            return new float[]{0f};
+        }
+    }
+
+    private int argMax(float[] arr) {
+        int idx = 0;
+        float m = Float.NEGATIVE_INFINITY;
+        for (int i = 0; i < arr.length; ++i) {
+            if (arr[i] > m) { m = arr[i]; idx = i; }
+        }
+        return idx;
+    }
+
+    private Double extractAmountHeuristic(String sms) {
+        // Find first number-like substring with optional decimal and thousand separators
+        String s = sms.replaceAll(",", "");
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("(\\d+\\.?\\d{0,2})").matcher(s);
+        if (m.find()) {
+            try {
+                return Double.parseDouble(m.group(1));
+            } catch (Exception e) { return null; }
         }
         return null;
     }
-    
-    /**
-     * Parse amount output from ONNX tensor
-     * Model returns: [amount_value]
-     * NO manual computation - model already extracted the amount
-     */
-    private Double parseAmountOutput(OnnxTensor tensor) {
-        try {
-            float[][] output = (float[][]) tensor.getValue();
-            if (output.length > 0 && output[0].length > 0) {
-                // Model already computed the amount - just return it
-                double amount = output[0][0];
-                return amount; // Return model's output directly - no validation or filtering
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "Error parsing amount output", e);
+
+    private String extractDescriptionHeuristic(String sms) {
+        String lower = sms.toLowerCase();
+        if (lower.contains(" to ")) {
+            int idx = lower.indexOf(" to ");
+            return sms.substring(idx + 4).trim();
         }
-        return null;
-    }
-    
-    /**
-     * Parse description output from ONNX tensor
-     * Model returns: description text or token IDs
-     * NO manual computation - model already generated the description
-     */
-    private String parseDescriptionOutput(OnnxTensor tensor) {
-        try {
-            // Model already generated the description - just extract it
-            // Option 1: Direct text output from model
-            String[][] output = (String[][]) tensor.getValue();
-            if (output.length > 0 && output[0].length > 0) {
-                return output[0][0]; // Return model's generated description directly
-            }
-            
-            // Option 2: If model outputs token IDs, you may need a tokenizer
-            // But this should be minimal - model did the generation work
-            // int[][] tokenIds = (int[][]) tensor.getValue();
-            // return decodeTokens(tokenIds); // Only decoding, no manual generation
-            
-        } catch (Exception e) {
-            Log.w(TAG, "Error parsing description output", e);
+        if (lower.contains(" via ")) {
+            int idx = lower.indexOf(" via ");
+            return sms.substring(0, idx).trim();
         }
-        return null;
+        // fallback: return first 30 chars
+        String trimmed = sms.trim();
+        return trimmed.length() > 30 ? trimmed.substring(0,30) : trimmed;
     }
-    
-    /**
-     * Parse fraud output from ONNX tensor
-     * Model returns: [fraud_probability] or [fraud_class]
-     * NO manual computation - model already detected fraud
-     */
-    private boolean parseFraudOutput(OnnxTensor tensor) {
-        try {
-            float[][] output = (float[][]) tensor.getValue();
-            if (output.length > 0 && output[0].length > 0) {
-                // Model already computed fraud detection - just extract the result
-                // If model outputs probability, use it directly
-                // If model outputs class (0/1), use it directly
-                float fraudValue = output[0][0];
-                return fraudValue > 0.5f; // Minimal threshold - model did the detection work
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "Error parsing fraud output", e);
+
+    private String escapeJson(String s) {
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    // Very simple fallback using heuristics if models unavailable
+    private String fallbackResponseBasedOnHeuristics(String sms) {
+        String lower = sms == null ? "" : sms.toLowerCase();
+        String type = null;
+        if (lower.contains("debit") || lower.contains("debited") || lower.contains("spent")) type = "debit";
+        if (lower.contains("credit") || lower.contains("credited") || lower.contains("received")) type = "credit";
+        Double amount = extractAmountHeuristic(sms);
+        String desc = extractDescriptionHeuristic(sms);
+        boolean fraud = lower.contains("otp") || lower.contains("blocked");
+        if (type == null) {
+            // rule: if type not found => nulls + fraud true
+            return "{\"type\":null,\"amount\":null,\"description\":null,\"fraud\":true}";
         }
-        return false;
+        return "{"
+                + "\"type\":\"" + type + "\","
+                + "\"amount\":" + (amount == null ? "null" : amount) + ","
+                + "\"description\":" + (desc == null ? "null" : "\"" + escapeJson(desc) + "\"") + ","
+                + "\"fraud\":" + fraud
+                + "}";
     }
-    
-    /**
-     * Warm up the model for faster first inference
-     */
+
     public void warmup() {
-        if (ortSession != null && modelReady) {
-            executorService.execute(() -> {
-                try {
-                    // Run a dummy inference to warm up
-                    float[] dummyInput = new float[128]; // Adjust size
-                    long[] shape = {1, 128};
-                    OnnxTensor inputTensor = OnnxTensor.createTensor(ortEnvironment, FloatBuffer.wrap(dummyInput), shape);
-                    Map<String, OnnxTensor> inputs = new HashMap<>();
-                    inputs.put("input", inputTensor);
-                    OrtSession.Result outputs = ortSession.run(inputs);
-                    outputs.close();
-                    inputTensor.close();
-                } catch (Exception e) {
-                    Log.w(TAG, "Warmup failed", e);
-                }
-            });
-        }
+        // no-op
     }
-    
-    /**
-     * Check if model is ready to use
-     */
-    public boolean isModelReady() {
-        return modelReady && ortSession != null;
-    }
-    
-    /**
-     * Cleanup resources
-     */
-    public void close() {
-        if (ortSession != null) {
-            try {
-                ortSession.close();
-            } catch (Exception e) {
-                Log.e(TAG, "Error closing ONNX session", e);
-            }
-            ortSession = null;
-        }
-        if (executorService != null) {
-            executorService.shutdown();
-        }
-    }
-    
-    /**
-     * Inner class to hold transaction parsing results
-     */
-    private static class TransactionResult {
-        String type;
-        Double amount;
-        String description;
-        boolean fraud;
-        
-        TransactionResult(String type, Double amount, String description, boolean fraud) {
-            this.type = type;
-            this.amount = amount;
-            this.description = description;
-            this.fraud = fraud;
-        }
-        
-        String toJson() {
-            StringBuilder json = new StringBuilder();
-            json.append("{\n");
-            json.append("  \"type\": ");
-            if (type == null) {
-                json.append("null");
-            } else {
-                json.append("\"").append(type).append("\"");
-            }
-            json.append(",\n");
-            json.append("  \"amount\": ");
-            if (amount == null) {
-                json.append("null");
-            } else {
-                json.append(amount.intValue()); // Return as number
-            }
-            json.append(",\n");
-            json.append("  \"description\": ");
-            if (description == null) {
-                json.append("null");
-            } else {
-                json.append("\"").append(escapeJson(description)).append("\"");
-            }
-            json.append(",\n");
-            json.append("  \"fraud\": ").append(fraud).append("\n");
-            json.append("}");
-            return json.toString();
-        }
-        
-        private String escapeJson(String str) {
-            return str.replace("\\", "\\\\")
-                     .replace("\"", "\\\"")
-                     .replace("\n", "\\n")
-                     .replace("\r", "\\r")
-                     .replace("\t", "\\t");
-        }
-    }
+
+    public boolean isModelReady() { return modelReady; }
 }
