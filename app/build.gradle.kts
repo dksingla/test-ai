@@ -45,7 +45,8 @@ dependencies {
     implementation(libs.navigation.ui)
     
     // TensorFlow Lite for SMS analysis
-    implementation("org.tensorflow:tensorflow-lite:2.14.0")
+    // Using latest version to support FULLY_CONNECTED opcode version 12
+    implementation("org.tensorflow:tensorflow-lite:2.17.0")
     implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
     
     // Retrofit for API calls

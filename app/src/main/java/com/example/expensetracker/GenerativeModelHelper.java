@@ -71,9 +71,22 @@ public class GenerativeModelHelper {
     private void initializeModel() {
         Log.d(TAG, "🔍 TFLITE_MODEL: Initializing TensorFlow Lite model...");
         try {
-            tfliteInterpreter = new Interpreter(loadModelFile());
+            ByteBuffer modelBuffer = loadModelFile();
+            Interpreter.Options options = new Interpreter.Options();
+            // Set number of threads for inference
+            options.setNumThreads(4);
+            // Enable NNAPI delegate if available (for better performance)
+            // options.setUseNNAPI(true);
+            
+            tfliteInterpreter = new Interpreter(modelBuffer, options);
             Log.d(TAG, "🔍 TFLITE_MODEL: ✅ Model loaded successfully");
             modelReady = true;
+        } catch (IllegalArgumentException e) {
+            Log.e(TAG, "🔍 TFLITE_MODEL: ❌ Model compatibility error", e);
+            Log.e(TAG, "🔍 TFLITE_MODEL: This usually means the model was created with a newer TensorFlow version.");
+            Log.e(TAG, "🔍 TFLITE_MODEL: Solution: Re-export the model with compatibility settings:");
+            Log.e(TAG, "🔍 TFLITE_MODEL: converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]");
+            modelReady = false;
         } catch (Exception e) {
             Log.e(TAG, "🔍 TFLITE_MODEL: ❌ Failed to initialize model", e);
             modelReady = false;
