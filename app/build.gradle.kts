@@ -44,8 +44,9 @@ dependencies {
     implementation(libs.navigation.fragment)
     implementation(libs.navigation.ui)
     
-    // ML Kit GenAI Prompt API
-    implementation("com.google.mlkit:genai-prompt:1.0.0-alpha1")
+    // TensorFlow Lite for SMS analysis
+    implementation("org.tensorflow:tensorflow-lite:2.14.0")
+    implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
     
     // Retrofit for API calls
     implementation("com.squareup.retrofit2:retrofit:2.9.0")

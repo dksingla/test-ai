@@ -5,39 +5,43 @@ import android.graphics.Bitmap;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
-import androidx.core.content.ContextCompat;
 
-import com.google.common.util.concurrent.FutureCallback;
-import com.google.common.util.concurrent.Futures;
-import com.google.mlkit.genai.common.GenAiException;
-import com.google.mlkit.genai.prompt.Candidate;
-import com.google.mlkit.genai.prompt.Generation;
-import com.google.mlkit.genai.prompt.GenerateContentRequest;
-import com.google.mlkit.genai.prompt.GenerateContentResponse;
-import com.google.mlkit.genai.prompt.GenerativeModel;
-import com.google.mlkit.genai.prompt.java.GenerativeModelFutures;
-import com.google.mlkit.genai.prompt.ImagePart;
-import com.google.mlkit.genai.prompt.TextPart;
+import org.tensorflow.lite.Interpreter;
 
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.text.DecimalFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
-import java.util.concurrent.Executor;
+import java.util.Locale;
+import java.util.Map;
+import java.util.regex.Pattern;
+
+import org.json.JSONObject;
 
 /**
- * Helper class to manage ML Kit GenAI Prompt API operations.
- * Handles model initialization, status checking, downloading, and content generation.
+ * Helper class to manage TensorFlow Lite model for SMS analysis.
+ * Handles model loading, text preprocessing, and inference to extract
+ * transaction type (credit/debit) and amount from SMS messages.
  */
 public class GenerativeModelHelper {
     private static final String TAG = "GenerativeModelHelper";
+    private static final String MODEL_FILE = "sms_model.tflite";
     
-    // Feature status constants (from FeatureStatus enum)
-    private static final int FEATURE_STATUS_AVAILABLE = 1;
-    private static final int FEATURE_STATUS_UNAVAILABLE = 2;
-    private static final int FEATURE_STATUS_DOWNLOADING = 3;
-    private static final int FEATURE_STATUS_DOWNLOADABLE = 4;
+    // Model parameters (from Python training code)
+    private static final int MAX_SEQUENCE_LENGTH = 40;
+    private static final int VOCAB_SIZE = 800;
+    private static final String OOV_TOKEN = "<OOV>";
+    private static final int OOV_TOKEN_ID = 1; // Typically OOV is token 1
     
-    private GenerativeModelFutures generativeModelFutures;
+    private Interpreter tfliteInterpreter;
     private Context context;
     private boolean modelReady = false;
+    private SimpleTokenizer tokenizer;
     
     public interface ModelStatusCallback {
         void onStatusChecked(int status);
@@ -54,118 +58,71 @@ public class GenerativeModelHelper {
     }
     
     public GenerativeModelHelper(Context context) {
-        Log.d(TAG, "🔍 GEMINI_NANO: GenerativeModelHelper constructor called");
+        Log.d(TAG, "🔍 TFLITE_MODEL: GenerativeModelHelper constructor called");
         this.context = context;
+        this.tokenizer = new SimpleTokenizer();
         initializeModel();
     }
     
     /**
-     * Initialize the GenerativeModel instance
+     * Initialize the TensorFlow Lite model
      */
     private void initializeModel() {
-        Log.d(TAG, "🔍 GEMINI_NANO: Initializing GenerativeModel...");
+        Log.d(TAG, "🔍 TFLITE_MODEL: Initializing TensorFlow Lite model...");
         try {
-            GenerativeModel generativeModel = Generation.INSTANCE.getClient();
-            generativeModelFutures = GenerativeModelFutures.from(generativeModel);
-            Log.d(TAG, "🔍 GEMINI_NANO: GenerativeModel initialized successfully");
+            tfliteInterpreter = new Interpreter(loadModelFile());
+            Log.d(TAG, "🔍 TFLITE_MODEL: ✅ Model loaded successfully");
+            modelReady = true;
         } catch (Exception e) {
-            Log.e(TAG, "🔍 GEMINI_NANO: Failed to initialize GenerativeModel", e);
-            throw e;
+            Log.e(TAG, "🔍 TFLITE_MODEL: ❌ Failed to initialize model", e);
+            modelReady = false;
         }
     }
     
     /**
-     * Check the status of Gemini Nano and download if needed
+     * Load model file from assets
+     */
+    private MappedByteBuffer loadModelFile() throws IOException {
+        Log.d(TAG, "🔍 TFLITE_MODEL: Loading model from assets: " + MODEL_FILE);
+        FileInputStream fileInputStream = context.getAssets().open(MODEL_FILE);
+        FileChannel fileChannel = fileInputStream.getChannel();
+        long startOffset = 0;
+        long declaredLength = fileChannel.size();
+        MappedByteBuffer buffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength);
+        fileInputStream.close();
+        Log.d(TAG, "🔍 TFLITE_MODEL: Model file loaded, size: " + declaredLength + " bytes");
+        return buffer;
+    }
+    
+    /**
+     * Check and prepare model (for compatibility with existing interface)
      */
     public void checkAndPrepareModel(ModelStatusCallback callback) {
-        Log.d(TAG, "🔍 GEMINI_NANO: Starting availability check...");
+        Log.d(TAG, "🔍 TFLITE_MODEL: checkAndPrepareModel() called");
         
-        if (generativeModelFutures == null) {
-            Log.d(TAG, "🔍 GEMINI_NANO: generativeModelFutures is null, initializing model...");
-            initializeModel();
+        if (tfliteInterpreter == null) {
+            Log.d(TAG, "🔍 TFLITE_MODEL: Model not loaded, attempting to initialize...");
+            try {
+                initializeModel();
+            } catch (Exception e) {
+                Log.e(TAG, "🔍 TFLITE_MODEL: ❌ Failed to initialize model", e);
+                callback.onDownloadFailed("Failed to load model: " + e.getMessage());
+                return;
+            }
         }
         
-        Executor mainExecutor = ContextCompat.getMainExecutor(context);
-        
-        Log.d(TAG, "🔍 GEMINI_NANO: Calling checkStatus() API...");
-        Futures.addCallback(generativeModelFutures.checkStatus(), new FutureCallback<Integer>() {
-            @Override
-            public void onSuccess(Integer featureStatus) {
-                Log.d(TAG, "🔍 GEMINI_NANO: Status check SUCCESS - Feature Status Code: " + featureStatus);
-                callback.onStatusChecked(featureStatus);
-                
-                if (featureStatus == FEATURE_STATUS_AVAILABLE) {
-                    Log.i(TAG, "🔍 GEMINI_NANO: ✅ AVAILABLE - Gemini Nano is available and ready to use");
-                    modelReady = true;
-                    callback.onModelReady();
-                } else if (featureStatus == FEATURE_STATUS_UNAVAILABLE) {
-                    Log.w(TAG, "🔍 GEMINI_NANO: ❌ UNAVAILABLE - Gemini Nano is not supported on this device");
-                    callback.onDownloadFailed("Gemini Nano not supported on this device");
-                } else if (featureStatus == FEATURE_STATUS_DOWNLOADING) {
-                    Log.i(TAG, "🔍 GEMINI_NANO: ⏳ DOWNLOADING - Gemini Nano is currently being downloaded");
-                } else if (featureStatus == FEATURE_STATUS_DOWNLOADABLE) {
-                    Log.i(TAG, "🔍 GEMINI_NANO: 📥 DOWNLOADABLE - Gemini Nano can be downloaded, starting download...");
-                    // Note: Download functionality may need to be implemented differently
-                    // For now, we'll mark as ready if downloadable
-                    modelReady = true;
-                    callback.onModelReady();
-                } else {
-                    Log.w(TAG, "🔍 GEMINI_NANO: ⚠️ UNKNOWN STATUS - Unknown feature status code: " + featureStatus);
-                }
-            }
-            
-            @Override
-            public void onFailure(@NonNull Throwable t) {
-                Log.e(TAG, "🔍 GEMINI_NANO: ❌ FAILED - Status check failed", t);
-                
-                String errorMessage = t.getMessage();
-                String errorClass = t.getClass().getSimpleName();
-                Log.e(TAG, "🔍 GEMINI_NANO: Error Class: " + errorClass);
-                Log.e(TAG, "🔍 GEMINI_NANO: Error Message: " + errorMessage);
-                
-                String userFriendlyMessage;
-                
-                // Check for specific error codes - parse from error message as it's more reliable
-                if (errorMessage != null) {
-                    // Check for ErrorCode 606 - FEATURE_NOT_FOUND (Feature 636 - Gemini Nano)
-                    if (errorMessage.contains("ErrorCode 606") || 
-                        errorMessage.contains("FEATURE_NOT_FOUND") ||
-                        errorMessage.contains("Feature 636") ||
-                        errorMessage.contains("606-FEATURE_NOT_FOUND")) {
-                        Log.e(TAG, "🔍 GEMINI_NANO: ⚠️ ERROR CODE 606 - FEATURE_NOT_FOUND detected");
-                        Log.e(TAG, "🔍 GEMINI_NANO: Feature 636 (Gemini Nano) is not available on this device");
-                        userFriendlyMessage = "Gemini Nano is not available on this device. " +
-                                "This feature requires AICore and is currently only supported on select devices " +
-                                "(e.g., Pixel phones with Android 15+). " +
-                                "Please ensure AICore is installed and up to date from Google Play Store. " +
-                                "Note: If your device's bootloader is unlocked, Gemini Nano will not work.";
-                    } else if (errorMessage.contains("ErrorCode -101")) {
-                        Log.e(TAG, "🔍 GEMINI_NANO: ⚠️ ERROR CODE -101 - AICore not installed/outdated");
-                        userFriendlyMessage = "AICore is not installed or outdated. " +
-                                "Please install/update AICore from Google Play Store. " +
-                                "Note: AICore is currently only available on select devices (e.g., Pixel phones).";
-                    } else if (errorMessage.contains("AICore")) {
-                        Log.e(TAG, "🔍 GEMINI_NANO: ⚠️ AICore related error detected");
-                        userFriendlyMessage = "AICore error: " + errorMessage + 
-                                ". Please ensure AICore is installed and up to date.";
-                    } else {
-                        Log.e(TAG, "🔍 GEMINI_NANO: ⚠️ Unknown error type");
-                        userFriendlyMessage = "Failed to check Gemini Nano status: " + errorMessage;
-                    }
-                } else {
-                    Log.e(TAG, "🔍 GEMINI_NANO: ⚠️ Error message is null");
-                    userFriendlyMessage = "Failed to check Gemini Nano status. " +
-                            "Please ensure AICore is installed and up to date.";
-                }
-                
-                Log.e(TAG, "🔍 GEMINI_NANO: User-friendly error message: " + userFriendlyMessage);
-                callback.onDownloadFailed(userFriendlyMessage);
-            }
-        }, mainExecutor);
+        if (modelReady) {
+            Log.i(TAG, "🔍 TFLITE_MODEL: ✅ Model is ready");
+            callback.onStatusChecked(1); // FEATURE_STATUS_AVAILABLE
+            callback.onModelReady();
+        } else {
+            Log.e(TAG, "🔍 TFLITE_MODEL: ❌ Model is not ready");
+            callback.onDownloadFailed("Model failed to load");
+        }
     }
     
     /**
-     * Generate content from text-only input
+     * Generate content from text-only input (SMS analysis)
      */
     public void generateContent(String prompt, ContentGenerationCallback callback) {
         generateContent(prompt, null, callback);
@@ -173,115 +130,256 @@ public class GenerativeModelHelper {
     
     /**
      * Generate content from multimodal input (image + text)
+     * Note: Image input is not supported with TFLite model, only SMS text analysis
      */
     public void generateContent(String textPrompt, Bitmap image, ContentGenerationCallback callback) {
-        GenerateContentRequest.Builder requestBuilder;
-        
         if (image != null) {
-            requestBuilder = new GenerateContentRequest.Builder(
-                new ImagePart(image),
-                new TextPart(textPrompt)
-            );
+            Log.w(TAG, "🔍 TFLITE_MODEL: Image input not supported, ignoring image");
+        }
+        
+        if (!modelReady || tfliteInterpreter == null) {
+            callback.onFailure("Model is not ready. Please wait for model initialization.");
+            return;
+        }
+        
+        Log.d(TAG, "🔍 TFLITE_MODEL: Analyzing SMS text: " + textPrompt);
+        
+        try {
+            // Extract SMS text from prompt if it contains "SMS: " prefix
+            String smsText = textPrompt;
+            if (textPrompt.contains("SMS: \"")) {
+                int start = textPrompt.indexOf("SMS: \"") + 6;
+                int end = textPrompt.indexOf("\"", start);
+                if (end > start) {
+                    smsText = textPrompt.substring(start, end);
+                }
+            }
+            
+            // Preprocess SMS text
+            int[] inputSequence = preprocessText(smsText);
+            Log.d(TAG, "🔍 TFLITE_MODEL: Preprocessed sequence length: " + inputSequence.length);
+            
+            // Prepare input/output buffers
+            // Input should be int32 (token IDs) since the model has an Embedding layer
+            int[][] inputBuffer = new int[1][MAX_SEQUENCE_LENGTH];
+            float[][] typeOutput = new float[1][1];
+            float[][] amountOutput = new float[1][1];
+            
+            // Copy sequence to input buffer
+            System.arraycopy(inputSequence, 0, inputBuffer[0], 0, Math.min(inputSequence.length, MAX_SEQUENCE_LENGTH));
+            
+            // Run inference
+            Map<Integer, Object> outputs = new HashMap<>();
+            outputs.put(0, typeOutput);
+            outputs.put(1, amountOutput);
+            
+            Log.d(TAG, "🔍 TFLITE_MODEL: Running inference...");
+            tfliteInterpreter.runForMultipleInputsOutputs(new Object[]{inputBuffer}, outputs);
+            
+            // Parse results
+            float typeProbability = typeOutput[0][0];
+            float amount = amountOutput[0][0];
+            
+            Log.d(TAG, "🔍 TFLITE_MODEL: Inference results - Type probability: " + typeProbability + ", Amount: " + amount);
+            
+            // Convert to readable format
+            String type = typeProbability >= 0.5 ? "debit" : "credit";
+            DecimalFormat df = new DecimalFormat("#.##");
+            String amountStr = "₹" + df.format(Math.abs(amount));
+            
+            // Generate description
+            String description = generateDescription(smsText, type, amount);
+            
+            // Create JSON response
+            JSONObject jsonResponse = new JSONObject();
+            jsonResponse.put("type", type);
+            jsonResponse.put("amount", amountStr);
+            jsonResponse.put("description", description);
+            
+            String jsonString = jsonResponse.toString();
+            Log.d(TAG, "🔍 TFLITE_MODEL: ✅ Analysis complete: " + jsonString);
+            callback.onSuccess(jsonString);
+            
+        } catch (Exception e) {
+            Log.e(TAG, "🔍 TFLITE_MODEL: ❌ Analysis failed", e);
+            callback.onFailure("Analysis failed: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * Preprocess text: tokenize and pad to MAX_SEQUENCE_LENGTH
+     */
+    private int[] preprocessText(String text) {
+        // Tokenize text
+        List<Integer> tokens = tokenizer.textsToSequences(text);
+        
+        // Pad or truncate to MAX_SEQUENCE_LENGTH
+        int[] sequence = new int[MAX_SEQUENCE_LENGTH];
+        Arrays.fill(sequence, 0); // Padding with 0
+        
+        int length = Math.min(tokens.size(), MAX_SEQUENCE_LENGTH);
+        for (int i = 0; i < length; i++) {
+            sequence[i] = tokens.get(i);
+        }
+        
+        return sequence;
+    }
+    
+    /**
+     * Generate description from SMS text, type, and amount
+     */
+    private String generateDescription(String smsText, String type, float amount) {
+        // Extract key information from SMS
+        String lowerSms = smsText.toLowerCase();
+        
+        // Try to find merchant/payee name
+        String merchant = extractMerchantName(smsText);
+        
+        // Build description
+        String action = type.equals("credit") ? "received from" : "paid to";
+        DecimalFormat df = new DecimalFormat("#.##");
+        String amountStr = "₹" + df.format(Math.abs(amount));
+        
+        if (!merchant.isEmpty()) {
+            return String.format(Locale.getDefault(), "%s %s %s transaction", 
+                merchant, action, amountStr);
         } else {
-            requestBuilder = new GenerateContentRequest.Builder(
-                new TextPart(textPrompt)
-            );
+            return String.format(Locale.getDefault(), "Bank %s %s transaction", 
+                type, amountStr);
         }
-        
-        generateContent(requestBuilder.build(), callback);
     }
     
     /**
-     * Execute the content generation request
+     * Extract merchant/payee name from SMS (simple heuristic)
      */
-    private void generateContent(GenerateContentRequest request, ContentGenerationCallback callback) {
-        Executor mainExecutor = ContextCompat.getMainExecutor(context);
+    private String extractMerchantName(String smsText) {
+        // Common patterns in Indian SMS
+        String[] patterns = {
+            "to\\s+([A-Z][A-Za-z\\s]+?)\\s+(?:UPI|bank|account)",
+            "from\\s+([A-Z][A-Za-z\\s]+?)\\s+(?:UPI|bank|account)",
+            "paid\\s+to\\s+([A-Z][A-Za-z\\s]+?)",
+            "received\\s+from\\s+([A-Z][A-Za-z\\s]+?)",
+        };
         
-        Futures.addCallback(
-            generativeModelFutures.generateContent(request),
-            new FutureCallback<GenerateContentResponse>() {
-                @Override
-                public void onSuccess(GenerateContentResponse response) {
-                    if (response != null) {
-                        List<Candidate> candidates = response.getCandidates();
-                        if (candidates != null && candidates.size() > 0) {
-                            Candidate candidate = candidates.get(0);
-                            String generatedText = candidate.getText();
-                            if (generatedText != null) {
-                                callback.onSuccess(generatedText);
-                            } else {
-                                callback.onFailure("No text in response");
-                            }
-                        } else {
-                            callback.onFailure("No candidates in response");
-                        }
-                    } else {
-                        callback.onFailure("No response generated");
-                    }
+        for (String pattern : patterns) {
+            Pattern p = Pattern.compile(pattern, Pattern.CASE_INSENSITIVE);
+            java.util.regex.Matcher m = p.matcher(smsText);
+            if (m.find()) {
+                String name = m.group(1).trim();
+                if (name.length() > 2 && name.length() < 30) {
+                    return name;
                 }
-                
-                @Override
-                public void onFailure(@NonNull Throwable t) {
-                    Log.e(TAG, "Content generation failed", t);
-                    
-                    // Check for AICore error specifically
-                    String errorMessage = t.getMessage();
-                    if (errorMessage != null && errorMessage.contains("ErrorCode -101")) {
-                        callback.onFailure("AICore is not installed or outdated. " +
-                                "Please install/update AICore from Google Play Store. " +
-                                "Note: AICore is currently only available on select devices (e.g., Pixel phones).");
-                    } else if (errorMessage != null && errorMessage.contains("AICore")) {
-                        callback.onFailure("AICore error: " + errorMessage + 
-                                ". Please ensure AICore is installed and up to date.");
-                    } else {
-                        callback.onFailure("Generation failed: " + errorMessage);
-                    }
-                }
-            },
-            mainExecutor
-        );
-    }
-    
-    /**
-     * Warm up the model for faster first inference
-     */
-    public void warmup() {
-        if (generativeModelFutures != null) {
-            generativeModelFutures.warmup();
+            }
         }
+        
+        return "";
     }
     
     /**
      * Check if model is ready to use
      */
     public boolean isModelReady() {
-        Log.d(TAG, "🔍 GEMINI_NANO: isModelReady() called - returning: " + modelReady);
+        Log.d(TAG, "🔍 TFLITE_MODEL: isModelReady() called - returning: " + modelReady);
         return modelReady;
     }
     
     /**
-     * Check if AICore is available by attempting to check model status
-     * This is a lightweight check that will fail fast if AICore is not available
+     * Check AICore availability (for compatibility - not needed for TFLite)
      */
     public void checkAICoreAvailability(ModelStatusCallback callback) {
-        Log.d(TAG, "🔍 GEMINI_NANO: checkAICoreAvailability() called");
-        
-        if (generativeModelFutures == null) {
-            Log.d(TAG, "🔍 GEMINI_NANO: generativeModelFutures is null, attempting to initialize...");
-            try {
-                initializeModel();
-                Log.d(TAG, "🔍 GEMINI_NANO: Model initialization successful, proceeding with status check");
-            } catch (Exception e) {
-                Log.e(TAG, "🔍 GEMINI_NANO: ❌ FAILED - Model initialization exception - AICore may not be available", e);
-                Log.e(TAG, "🔍 GEMINI_NANO: Exception type: " + e.getClass().getSimpleName());
-                Log.e(TAG, "🔍 GEMINI_NANO: Exception message: " + e.getMessage());
-                callback.onDownloadFailed("AICore is not available: " + e.getMessage());
-                return;
-            }
-        } else {
-            Log.d(TAG, "🔍 GEMINI_NANO: generativeModelFutures already initialized, proceeding with status check");
-        }
-        
+        Log.d(TAG, "🔍 TFLITE_MODEL: checkAICoreAvailability() called (not needed for TFLite)");
         checkAndPrepareModel(callback);
     }
+    
+    /**
+     * Warm up the model for faster first inference
+     */
+    public void warmup() {
+        if (tfliteInterpreter != null && modelReady) {
+            Log.d(TAG, "🔍 TFLITE_MODEL: Warming up model...");
+            try {
+                // Run a dummy inference to warm up
+                int[][] dummyInput = new int[1][MAX_SEQUENCE_LENGTH];
+                float[][] dummyTypeOutput = new float[1][1];
+                float[][] dummyAmountOutput = new float[1][1];
+                
+                Map<Integer, Object> outputs = new HashMap<>();
+                outputs.put(0, dummyTypeOutput);
+                outputs.put(1, dummyAmountOutput);
+                
+                tfliteInterpreter.runForMultipleInputsOutputs(new Object[]{dummyInput}, outputs);
+                Log.d(TAG, "🔍 TFLITE_MODEL: ✅ Model warmed up");
+            } catch (Exception e) {
+                Log.e(TAG, "🔍 TFLITE_MODEL: Failed to warm up model", e);
+            }
+        }
+    }
+    
+    /**
+     * Simple tokenizer implementation
+     * Note: This is a basic implementation. For best results, use the exact tokenizer
+     * vocabulary from training, but this should work reasonably well.
+     */
+    private static class SimpleTokenizer {
+        private static final Pattern WORD_PATTERN = Pattern.compile("\\b\\w+\\b");
+        private static final Map<String, Integer> wordToIndex = new HashMap<>();
+        private static final int UNKNOWN_TOKEN_ID = 1; // OOV token
+        
+        static {
+            // Initialize with common words (this is a simplified version)
+            // In production, you should load the actual tokenizer vocabulary
+            initializeCommonWords();
+        }
+        
+        private static void initializeCommonWords() {
+            // Add common banking/transaction words
+            String[] commonWords = {
+                "rs", "inr", "rupees", "paid", "received", "credit", "debit",
+                "account", "balance", "transaction", "upi", "bank", "to", "from",
+                "ref", "id", "avail", "bal", "amt", "amount", "date", "time"
+            };
+            
+            int index = 2; // Start from 2 (0 is padding, 1 is OOV)
+            for (String word : commonWords) {
+                wordToIndex.put(word.toLowerCase(), index++);
+            }
+        }
+        
+        public List<Integer> textsToSequences(String text) {
+            List<Integer> sequences = new ArrayList<>();
+            String lowerText = text.toLowerCase();
+            
+            // Extract words
+            java.util.regex.Matcher matcher = WORD_PATTERN.matcher(lowerText);
+            while (matcher.find()) {
+                String word = matcher.group();
+                Integer tokenId = wordToIndex.get(word);
+                
+                if (tokenId != null) {
+                    sequences.add(tokenId);
+                } else {
+                    // Use hash-based tokenization for unknown words
+                    // This ensures consistent tokenization
+                    int hashToken = Math.abs(word.hashCode() % VOCAB_SIZE);
+                    if (hashToken == 0) hashToken = UNKNOWN_TOKEN_ID;
+                    sequences.add(hashToken);
+                }
+            }
+            
+            return sequences;
+        }
+    }
+    
+    /**
+     * Cleanup resources
+     */
+    public void close() {
+        if (tfliteInterpreter != null) {
+            tfliteInterpreter.close();
+            tfliteInterpreter = null;
+            modelReady = false;
+            Log.d(TAG, "🔍 TFLITE_MODEL: Model interpreter closed");
+        }
+    }
 }
+
