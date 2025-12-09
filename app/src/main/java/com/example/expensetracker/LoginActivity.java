@@ -51,7 +51,7 @@ public class LoginActivity extends AppCompatActivity {
     
     private void initializeModel() {
         try {
-            generativeModelHelper.checkAICoreAvailability(new GenerativeModelHelper.ModelStatusCallback() {
+            generativeModelHelper.checkAndPrepareModel(new GenerativeModelHelper.ModelStatusCallback() {
                 @Override
                 public void onStatusChecked(int status) {
                     Log.d(TAG, "Model status checked: " + status);
@@ -76,14 +76,8 @@ public class LoginActivity extends AppCompatActivity {
                 public void onDownloadFailed(String error) {
                     Log.e(TAG, "Model initialization failed: " + error);
                     // Show user-friendly error message
-                    String userMessage = error;
-                    if (error != null && error.contains("AICore")) {
-                        userMessage = "AI features require AICore. " +
-                                "AICore is only available on select devices (e.g., Pixel phones) " +
-                                "and may need to be installed from Google Play Store.";
-                    }
-                    Toast.makeText(LoginActivity.this, userMessage, Toast.LENGTH_LONG).show();
-                    // Disable SMS analysis button if AICore is not available
+                    Toast.makeText(LoginActivity.this, "AI model failed to load: " + error, Toast.LENGTH_LONG).show();
+                    // Disable SMS analysis button if model is not available
                     binding.analyzeSmsButton.setEnabled(false);
                     binding.analyzeSmsButton.setText("AI Not Available");
                 }
@@ -236,7 +230,7 @@ public class LoginActivity extends AppCompatActivity {
         
         // Check if model is ready
         if (!generativeModelHelper.isModelReady()) {
-            Toast.makeText(this, "AI model is not ready. Please wait or check if AICore is installed.", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "AI model is not ready. Please wait.", Toast.LENGTH_LONG).show();
             return;
         }
 
@@ -254,19 +248,8 @@ public class LoginActivity extends AppCompatActivity {
             }
         }
 
-        // Build the prompt
-        String prompt = "You are an AI assistant that analyzes SMS messages for bank or UPI transactions.\n\n" +
-                "For each message, do the following:\n\n" +
-                "1. Determine the transaction type: 'credit' or 'debit'.\n\n" +
-                "2. Extract the transaction amount as a string (include currency if present).\n\n" +
-                "3. Create a description between 10-15 words containing:\n" +
-                "   - Payee or payer name (person or company)\n" +
-                "   - Transaction type (credit or debit)\n\n" +
-                "Return ONLY valid JSON with the keys: amount, description, type. Do NOT include extra text.\n\n" +
-                "SMS: \"" + smsText + "\"";
-
-        // Generate content using AI
-        generativeModelHelper.generateContent(prompt, new GenerativeModelHelper.ContentGenerationCallback() {
+        // Generate content using ONNX models (expects raw SMS text)
+        generativeModelHelper.generateContent(smsText, new GenerativeModelHelper.ContentGenerationCallback() {
             @Override
             public void onSuccess(String response) {
                 isAnalyzingSms = false;
