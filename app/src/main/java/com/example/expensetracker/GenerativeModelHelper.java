@@ -8,10 +8,11 @@ import androidx.annotation.NonNull;
 
 import org.tensorflow.lite.Interpreter;
 
-import java.io.FileInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.nio.MappedByteBuffer;
-import java.nio.channels.FileChannel;
+import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.text.DecimalFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -82,16 +83,29 @@ public class GenerativeModelHelper {
     /**
      * Load model file from assets
      */
-    private MappedByteBuffer loadModelFile() throws IOException {
+    private ByteBuffer loadModelFile() throws IOException {
         Log.d(TAG, "🔍 TFLITE_MODEL: Loading model from assets: " + MODEL_FILE);
-        FileInputStream fileInputStream = context.getAssets().open(MODEL_FILE);
-        FileChannel fileChannel = fileInputStream.getChannel();
-        long startOffset = 0;
-        long declaredLength = fileChannel.size();
-        MappedByteBuffer buffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength);
-        fileInputStream.close();
-        Log.d(TAG, "🔍 TFLITE_MODEL: Model file loaded, size: " + declaredLength + " bytes");
-        return buffer;
+        InputStream inputStream = context.getAssets().open(MODEL_FILE);
+        
+        // Read all bytes from the input stream
+        ByteArrayOutputStream byteBuffer = new ByteArrayOutputStream();
+        byte[] buffer = new byte[1024];
+        int len;
+        while ((len = inputStream.read(buffer)) != -1) {
+            byteBuffer.write(buffer, 0, len);
+        }
+        inputStream.close();
+        
+        byte[] modelBytes = byteBuffer.toByteArray();
+        
+        // Create ByteBuffer from byte array
+        ByteBuffer modelBuffer = ByteBuffer.allocateDirect(modelBytes.length);
+        modelBuffer.order(ByteOrder.nativeOrder());
+        modelBuffer.put(modelBytes);
+        modelBuffer.rewind();
+        
+        Log.d(TAG, "🔍 TFLITE_MODEL: Model file loaded, size: " + modelBytes.length + " bytes");
+        return modelBuffer;
     }
     
     /**
