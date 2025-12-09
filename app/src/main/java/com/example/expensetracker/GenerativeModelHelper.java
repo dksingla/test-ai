@@ -9,6 +9,7 @@ import androidx.core.content.ContextCompat;
 
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
+import com.google.mlkit.genai.common.GenAiException;
 import com.google.mlkit.genai.prompt.Candidate;
 import com.google.mlkit.genai.prompt.Generation;
 import com.google.mlkit.genai.prompt.GenerateContentRequest;
@@ -101,7 +102,38 @@ public class GenerativeModelHelper {
             @Override
             public void onFailure(@NonNull Throwable t) {
                 Log.e(TAG, "Failed to check Gemini Nano status", t);
-                callback.onDownloadFailed("Failed to check status: " + t.getMessage());
+                
+                String errorMessage = t.getMessage();
+                String userFriendlyMessage;
+                
+                // Check for specific error codes - parse from error message as it's more reliable
+                if (errorMessage != null) {
+                    // Check for ErrorCode 606 - FEATURE_NOT_FOUND (Feature 636 - Gemini Nano)
+                    if (errorMessage.contains("ErrorCode 606") || 
+                        errorMessage.contains("FEATURE_NOT_FOUND") ||
+                        errorMessage.contains("Feature 636") ||
+                        errorMessage.contains("606-FEATURE_NOT_FOUND")) {
+                        userFriendlyMessage = "Gemini Nano is not available on this device. " +
+                                "This feature requires AICore and is currently only supported on select devices " +
+                                "(e.g., Pixel phones with Android 15+). " +
+                                "Please ensure AICore is installed and up to date from Google Play Store. " +
+                                "Note: If your device's bootloader is unlocked, Gemini Nano will not work.";
+                    } else if (errorMessage.contains("ErrorCode -101")) {
+                        userFriendlyMessage = "AICore is not installed or outdated. " +
+                                "Please install/update AICore from Google Play Store. " +
+                                "Note: AICore is currently only available on select devices (e.g., Pixel phones).";
+                    } else if (errorMessage.contains("AICore")) {
+                        userFriendlyMessage = "AICore error: " + errorMessage + 
+                                ". Please ensure AICore is installed and up to date.";
+                    } else {
+                        userFriendlyMessage = "Failed to check Gemini Nano status: " + errorMessage;
+                    }
+                } else {
+                    userFriendlyMessage = "Failed to check Gemini Nano status. " +
+                            "Please ensure AICore is installed and up to date.";
+                }
+                
+                callback.onDownloadFailed(userFriendlyMessage);
             }
         }, mainExecutor);
     }
