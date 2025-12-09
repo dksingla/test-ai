@@ -34,6 +34,11 @@ android {
     }
 }
 
+// Exclude litert-api from all configurations to avoid conflicts with tensorflow-lite
+configurations.all {
+    exclude(group = "com.google.ai.edge.litert", module = "litert-api")
+}
+
 dependencies {
 
     implementation(libs.appcompat)
@@ -47,7 +52,6 @@ dependencies {
     // TensorFlow Lite for SMS analysis
     // Using latest version to support FULLY_CONNECTED opcode version 12
     implementation("org.tensorflow:tensorflow-lite:2.17.0")
-    implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
     
     // Retrofit for API calls
     implementation("com.squareup.retrofit2:retrofit:2.9.0")
