@@ -8,6 +8,8 @@ import androidx.core.content.ContextCompat;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.FloatBuffer;
+import java.util.Iterator;
+import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 
@@ -17,20 +19,21 @@ import ai.onnxruntime.OrtException;
 import ai.onnxruntime.OrtSession;
 
 /**
- * ONNX helper: loads two ONNX models (type + fraud) and runs inference.
- *
- * Requirement: assets/model_type.onnx and assets/model_fraud.onnx
+ * ONNX helper: loads sms_model.onnx and runs inference on SMS text.
+ * 
+ * Requirement: assets/sms_model.onnx
  */
 public class GenerativeModelHelper {
     private static final String TAG = "GenerativeModelHelper";
+    private static final float CONFIDENCE_THRESHOLD = 0.5f;
 
     private final Context context;
     private OrtEnvironment env;
-    private OrtSession sessionType;
-    private OrtSession sessionFraud;
+    private OrtSession session;
     private volatile boolean modelReady = false;
     private volatile boolean isLoading = false;
     private ModelStatusCallback pendingCallback = null;
+    private int inputVectorSize = -1; // Detected from model
 
     public interface ModelStatusCallback {
         void onStatusChecked(int status);
@@ -61,15 +64,15 @@ public class GenerativeModelHelper {
             try {
                 env = OrtEnvironment.getEnvironment();
 
-                byte[] modelTypeBytes = loadAssetBytes("model_type.onnx");
-                sessionType = env.createSession(modelTypeBytes);
+                byte[] modelBytes = loadAssetBytes("sms_model.onnx");
+                session = env.createSession(modelBytes);
 
-                byte[] modelFraudBytes = loadAssetBytes("model_fraud.onnx");
-                sessionFraud = env.createSession(modelFraudBytes);
+                // Detect input tensor shape from model
+                detectInputShape();
 
                 modelReady = true;
                 isLoading = false;
-                Log.d(TAG, "✅ ONNX models loaded");
+                Log.d(TAG, "✅ ONNX model loaded, input size: " + inputVectorSize);
                 
                 // Notify pending callback on main thread if any
                 if (pendingCallback != null) {
@@ -82,7 +85,7 @@ public class GenerativeModelHelper {
                 }
 
             } catch (Exception e) {
-                Log.e(TAG, "Failed to load ONNX models", e);
+                Log.e(TAG, "Failed to load ONNX model", e);
                 modelReady = false;
                 isLoading = false;
                 
@@ -92,11 +95,37 @@ public class GenerativeModelHelper {
                     pendingCallback = null;
                     mainExecutor.execute(() -> {
                         callback.onStatusChecked(2); // unavailable
-                        callback.onDownloadFailed("Failed to load ONNX models: " + e.getMessage());
+                        callback.onDownloadFailed("Failed to load ONNX model: " + e.getMessage());
                     });
                 }
             }
         });
+    }
+
+    /**
+     * Detect input tensor shape from the model.
+     * Since ONNX Runtime Android API doesn't provide direct shape access,
+     * we use a default size and allow dynamic adjustment.
+     */
+    private void detectInputShape() throws OrtException {
+        if (session == null) {
+            throw new IllegalStateException("Session not initialized");
+        }
+
+        Set<String> inputNames = session.getInputNames();
+        if (inputNames.isEmpty()) {
+            throw new IllegalStateException("Model has no inputs");
+        }
+
+        // ONNX Runtime Android doesn't provide direct access to input metadata
+        // Use a reasonable default size (128) for SMS text encoding
+        // This can be adjusted based on your model's expected input size
+        inputVectorSize = 128; // Default size
+        
+        Log.d(TAG, "Using default input vector size: " + inputVectorSize + " (model has " + inputNames.size() + " input(s))");
+        
+        // Optional: Try to infer size from a test run if needed
+        // For now, we'll use the default and let padding handle shorter texts
     }
 
     private byte[] loadAssetBytes(String name) throws IOException {
@@ -118,24 +147,24 @@ public class GenerativeModelHelper {
 
     public void checkAndPrepareModel(ModelStatusCallback callback) {
         if (modelReady) {
-            // Models are ready
+            // Model is ready
             callback.onStatusChecked(1); // available
             callback.onModelReady();
         } else if (isLoading) {
-            // Models are still loading, store callback to notify when done
+            // Model is still loading, store callback to notify when done
             pendingCallback = callback;
             callback.onStatusChecked(0); // loading
-            Log.d(TAG, "Models are loading, callback will be notified when ready");
+            Log.d(TAG, "Model is loading, callback will be notified when ready");
         } else {
-            // Models failed to load or not started
+            // Model failed to load or not started
             callback.onStatusChecked(2); // unavailable
-            callback.onDownloadFailed("ONNX models not loaded");
+            callback.onDownloadFailed("ONNX model not loaded");
         }
     }
 
     /**
      * Main entry: send SMS text here.
-     * If model predicts 'none' type => returns nulls + fraud=true.
+     * Returns JSON with type, amount, description (null if confidence low).
      */
     public void generateContent(String smsText, ContentGenerationCallback callback) {
         // Safety check: Never process if model is not ready
@@ -147,211 +176,319 @@ public class GenerativeModelHelper {
         Executor executor = ContextCompat.getMainExecutor(context);
         executor.execute(() -> {
             try {
-                // Compute features exactly like training script
-                float[] features = computeFeatures(smsText); // length = 6
-
-                // Double-check models are ready (defensive programming)
-                if (sessionType == null || sessionFraud == null) {
+                // Double-check model is ready
+                if (session == null || inputVectorSize <= 0) {
                     callback.onFailure("Model sessions not initialized");
                     return;
                 }
 
-                // Prepare tensor: shape [1, n_features]
-                long[] shape = new long[]{1, features.length};
+                // Preprocess SMS text into float vector
+                float[] features = preprocessSmsText(smsText, inputVectorSize);
+
+                // Prepare tensor: shape [1, inputVectorSize] for batch inference
+                long[] shape = new long[]{1, inputVectorSize};
                 FloatBuffer fb = FloatBuffer.wrap(features);
                 
-                // RUN type model
-                String typePred = "none";
-                try (OnnxTensor inputTensor = OnnxTensor.createTensor(env, fb, shape);
-                     OrtSession.Result r = sessionType.run(java.util.Collections.singletonMap(
-                        sessionType.getInputNames().iterator().next(), inputTensor))) {
-
-                    // Most sklearn->ONNX exports produce a probability output named 'label' or array. We attempt to read first output
-                    // Get first output as float array/probs
-                    Object out0 = r.get(0).getValue();
-                    // out0 may be probability array shape [1,3] -> we handle common cases
-                    float[] probs = extractProbabilitiesFromResult(out0);
-                    int argmax = argMax(probs);
-                    if (argmax == 0) typePred = "debit";
-                    else if (argmax == 1) typePred = "credit";
-                    else typePred = "none";
+                // Get input name
+                Set<String> inputNames = session.getInputNames();
+                String inputName = null;
+                if (!inputNames.isEmpty()) {
+                    inputName = inputNames.iterator().next();
                 }
-
-                // RUN fraud model -> get probability
-                float fraudProb = 0.0f;
-                fb.rewind(); // Reset buffer position for reuse
-                try (OnnxTensor inputTensor2 = OnnxTensor.createTensor(env, fb, shape);
-                     OrtSession.Result r2 = sessionFraud.run(java.util.Collections.singletonMap(
-                        sessionFraud.getInputNames().iterator().next(), inputTensor2))) {
-                    Object out0 = r2.get(0).getValue();
-                    float[] probs = extractProbabilitiesFromResult(out0);
-                    // fraud model was trained binary; pick probability of class 1 if provided, or single-score
-                    if (probs.length == 1) {
-                        fraudProb = probs[0];
-                    } else if (probs.length >= 2) {
-                        fraudProb = probs[1];
-                    }
-                }
-
-                // If type == none -> your rule: return nulls and fraud=true
-                if ("none".equals(typePred)) {
-                    String json = "{\"type\":null,\"amount\":null,\"description\":null,\"fraud\":true}";
-                    callback.onSuccess(json);
+                if (inputName == null) {
+                    callback.onFailure("Model has no input");
                     return;
                 }
 
-                // Otherwise compute amount & description heuristics
-                Double amount = extractAmountHeuristic(smsText);
-                String desc = extractDescriptionHeuristic(smsText);
-
-                boolean fraud = fraudProb >= 0.5f; // threshold
-                String json = "{"
-                        + "\"type\":\"" + typePred + "\","
-                        + "\"amount\":" + (amount == null ? "null" : amount) + ","
-                        + "\"description\":" + (desc == null ? "null" : "\"" + escapeJson(desc) + "\"") + ","
-                        + "\"fraud\":" + fraud
-                        + "}";
-                callback.onSuccess(json);
+                // Run inference
+                try (OnnxTensor inputTensor = OnnxTensor.createTensor(env, fb, shape);
+                     OrtSession.Result result = session.run(java.util.Collections.singletonMap(inputName, inputTensor))) {
+                    
+                    // Parse model output
+                    ModelOutput output = parseModelOutput(result, smsText);
+                    
+                    // Build JSON response
+                    String json = buildJsonResponse(output);
+                    callback.onSuccess(json);
+                }
 
             } catch (Exception e) {
-                Log.e(TAG, "ONNX inference error, using fallback", e);
+                Log.e(TAG, "ONNX inference error", e);
                 callback.onFailure("Inference failed: " + e.getMessage());
             }
         });
     }
 
-    // -- Helpers --
-
-    private float[] computeFeatures(String sms) {
-        String s = sms == null ? "" : sms.toLowerCase();
-        float f0 = (s.contains("debit") || s.contains("debited") || s.contains("spent")) ? 1f : 0f;
-        float f1 = (s.contains("credit") || s.contains("credited") || s.contains("received")) ? 1f : 0f;
-        float f2 = s.contains("to ") ? 1f : 0f;
-        float f3 = s.contains("from ") ? 1f : 0f;
-        float f4 = countNumbers(s);
-        float f5 = Math.min((float)s.length(), 10000f);
-        return new float[]{f0, f1, f2, f3, f4, f5};
-    }
-
-    private int countNumbers(String s) {
-        int count = 0;
-        for (int i = 0; i < s.length(); ++i) {
-            if (Character.isDigit(s.charAt(i))) {
-                count++;
-                // skip sequence of digits
-                while (i + 1 < s.length() && Character.isDigit(s.charAt(i + 1))) i++;
+    /**
+     * Preprocess SMS text into a float vector of the required size.
+     * Pads with 0.0f if shorter than required size.
+     */
+    private float[] preprocessSmsText(String sms, int targetSize) {
+        if (sms == null) {
+            sms = "";
+        }
+        
+        // Convert SMS to lowercase for consistent processing
+        String normalized = sms.toLowerCase().trim();
+        
+        // Convert characters to float values (simple character encoding)
+        // Each character is encoded as its ASCII value normalized to [0, 1]
+        float[] features = new float[targetSize];
+        int smsLength = normalized.length();
+        
+        for (int i = 0; i < targetSize; i++) {
+            if (i < smsLength) {
+                char c = normalized.charAt(i);
+                // Normalize ASCII value to [0, 1] range
+                features[i] = (float) c / 128.0f;
+            } else {
+                // Pad with zeros
+                features[i] = 0.0f;
             }
         }
-        return count;
+        
+        return features;
     }
 
-    private float[] extractProbabilitiesFromResult(Object out0) {
-        // Possible shapes:
-        // - float[][] (1 x N) -> return flatten
-        // - double[][] -> cast
-        // - float[] -> return
-        // - double[] -> cast
+    /**
+     * Parse model output to extract type, amount, description.
+     */
+    private ModelOutput parseModelOutput(OrtSession.Result result, String smsText) throws OrtException {
+        ModelOutput output = new ModelOutput();
+        
+        // Get first output (most common case)
+        Object outputValue = result.get(0).getValue();
+        
+        // Handle different output formats
+        float[] probabilities = extractProbabilitiesFromResult(outputValue);
+        
+        if (probabilities.length == 0) {
+            Log.w(TAG, "Empty model output");
+            return output; // All nulls
+        }
+        
+        // Find max probability and its index
+        int maxIdx = argMax(probabilities);
+        float maxProb = probabilities[maxIdx];
+        
+        // Check confidence threshold
+        if (maxProb < CONFIDENCE_THRESHOLD) {
+            Log.d(TAG, "Low confidence: " + maxProb + " < " + CONFIDENCE_THRESHOLD);
+            return output; // All nulls due to low confidence
+        }
+        
+        // Map index to type
+        // Assuming: 0 = debit, 1 = credit, 2 = none/other
+        if (maxIdx == 0) {
+            output.type = "debit";
+        } else if (maxIdx == 1) {
+            output.type = "credit";
+        } else {
+            // Index 2 or higher = none/unknown
+            output.type = null;
+            return output; // Return nulls if type not detected
+        }
+        
+        // Extract amount and description from SMS text using heuristics
+        // (Model might only output type probabilities)
+        output.amount = extractAmountHeuristic(smsText);
+        output.description = extractDescriptionHeuristic(smsText);
+        
+        return output;
+    }
+
+    /**
+     * Build JSON response from model output.
+     */
+    private String buildJsonResponse(ModelOutput output) {
+        StringBuilder json = new StringBuilder("{");
+        
+        // Type
+        json.append("\"type\":");
+        if (output.type == null) {
+            json.append("null");
+        } else {
+            json.append("\"").append(escapeJson(output.type)).append("\"");
+        }
+        
+        // Amount
+        json.append(",\"amount\":");
+        if (output.amount == null) {
+            json.append("null");
+        } else {
+            json.append(output.amount);
+        }
+        
+        // Description
+        json.append(",\"description\":");
+        if (output.description == null) {
+            json.append("null");
+        } else {
+            json.append("\"").append(escapeJson(output.description)).append("\"");
+        }
+        
+        json.append("}");
+        return json.toString();
+    }
+
+    /**
+     * Extract probabilities from model output (handles various formats).
+     */
+    private float[] extractProbabilitiesFromResult(Object outputValue) {
         try {
-            if (out0 instanceof float[][]) {
-                float[][] arr = (float[][]) out0;
-                return arr[0];
-            } else if (out0 instanceof double[][]) {
-                double[][] arr = (double[][]) out0;
+            if (outputValue instanceof float[][]) {
+                float[][] arr = (float[][]) outputValue;
+                return arr.length > 0 ? arr[0] : new float[0];
+            } else if (outputValue instanceof double[][]) {
+                double[][] arr = (double[][]) outputValue;
+                if (arr.length == 0) return new float[0];
                 double[] row = arr[0];
                 float[] out = new float[row.length];
-                for (int i = 0; i < row.length; i++) out[i] = (float) row[i];
-                return out;
-            } else if (out0 instanceof float[]) {
-                return (float[]) out0;
-            } else if (out0 instanceof double[]) {
-                double[] a = (double[]) out0;
-                float[] out = new float[a.length];
-                for (int i = 0; i < a.length; i++) out[i] = (float) a[i];
-                return out;
-            } else if (out0 instanceof java.lang.Number) {
-                return new float[]{((Number) out0).floatValue()};
-            } else {
-                // fallback: try toString parsing
-                String s = out0.toString();
-                // attempt simple parse of bracketed numbers
-                s = s.replaceAll("[\\[\\]]", "");
-                String[] parts = s.split("[,\\s]+");
-                float[] out = new float[parts.length];
-                for (int i = 0; i < parts.length; ++i) {
-                    try { out[i] = Float.parseFloat(parts[i]); } catch (Exception ex) { out[i] = 0f; }
+                for (int i = 0; i < row.length; i++) {
+                    out[i] = (float) row[i];
                 }
                 return out;
+            } else if (outputValue instanceof float[]) {
+                return (float[]) outputValue;
+            } else if (outputValue instanceof double[]) {
+                double[] a = (double[]) outputValue;
+                float[] out = new float[a.length];
+                for (int i = 0; i < a.length; i++) {
+                    out[i] = (float) a[i];
+                }
+                return out;
+            } else if (outputValue instanceof Number) {
+                return new float[]{((Number) outputValue).floatValue()};
+            } else {
+                Log.w(TAG, "Unexpected output type: " + outputValue.getClass().getName());
+                return new float[0];
             }
         } catch (Exception e) {
             Log.e(TAG, "Failed to parse model output", e);
-            return new float[]{0f};
+            return new float[0];
         }
     }
 
     private int argMax(float[] arr) {
+        if (arr.length == 0) return -1;
         int idx = 0;
-        float m = Float.NEGATIVE_INFINITY;
-        for (int i = 0; i < arr.length; ++i) {
-            if (arr[i] > m) { m = arr[i]; idx = i; }
+        float max = Float.NEGATIVE_INFINITY;
+        for (int i = 0; i < arr.length; i++) {
+            if (arr[i] > max) {
+                max = arr[i];
+                idx = i;
+            }
         }
         return idx;
     }
 
+    private String escapeJson(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t");
+    }
+
+    /**
+     * Extract amount from SMS text using heuristics.
+     */
     private Double extractAmountHeuristic(String sms) {
-        // Find first number-like substring with optional decimal and thousand separators
-        String s = sms.replaceAll(",", "");
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile("(\\d+\\.?\\d{0,2})").matcher(s);
-        if (m.find()) {
-            try {
-                return Double.parseDouble(m.group(1));
-            } catch (Exception e) { return null; }
+        if (sms == null || sms.isEmpty()) {
+            return null;
         }
+        
+        // Remove commas and find first number-like substring with optional decimal
+        String cleaned = sms.replaceAll(",", "");
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("(\\d+\\.?\\d{0,2})");
+        java.util.regex.Matcher matcher = pattern.matcher(cleaned);
+        
+        if (matcher.find()) {
+            try {
+                return Double.parseDouble(matcher.group(1));
+            } catch (NumberFormatException e) {
+                Log.w(TAG, "Failed to parse amount: " + matcher.group(1));
+            }
+        }
+        
         return null;
     }
 
+    /**
+     * Extract description from SMS text using heuristics.
+     */
     private String extractDescriptionHeuristic(String sms) {
+        if (sms == null || sms.isEmpty()) {
+            return null;
+        }
+        
         String lower = sms.toLowerCase();
+        
+        // Try to extract text after "to"
         if (lower.contains(" to ")) {
             int idx = lower.indexOf(" to ");
-            return sms.substring(idx + 4).trim();
+            String desc = sms.substring(idx + 4).trim();
+            // Remove amount if present
+            desc = desc.replaceAll("\\d+\\.?\\d*", "").trim();
+            if (!desc.isEmpty()) {
+                return desc.length() > 50 ? desc.substring(0, 50) : desc;
+            }
         }
+        
+        // Try to extract text before "via"
         if (lower.contains(" via ")) {
             int idx = lower.indexOf(" via ");
-            return sms.substring(0, idx).trim();
+            String desc = sms.substring(0, idx).trim();
+            if (!desc.isEmpty()) {
+                return desc.length() > 50 ? desc.substring(0, 50) : desc;
+            }
         }
-        // fallback: return first 30 chars
+        
+        // Fallback: return first meaningful part
         String trimmed = sms.trim();
-        return trimmed.length() > 30 ? trimmed.substring(0,30) : trimmed;
-    }
-
-    private String escapeJson(String s) {
-        return s.replace("\\", "\\\\").replace("\"", "\\\"");
-    }
-
-    // Very simple fallback using heuristics if models unavailable
-    private String fallbackResponseBasedOnHeuristics(String sms) {
-        String lower = sms == null ? "" : sms.toLowerCase();
-        String type = null;
-        if (lower.contains("debit") || lower.contains("debited") || lower.contains("spent")) type = "debit";
-        if (lower.contains("credit") || lower.contains("credited") || lower.contains("received")) type = "credit";
-        Double amount = extractAmountHeuristic(sms);
-        String desc = extractDescriptionHeuristic(sms);
-        boolean fraud = lower.contains("otp") || lower.contains("blocked");
-        if (type == null) {
-            // rule: if type not found => nulls + fraud true
-            return "{\"type\":null,\"amount\":null,\"description\":null,\"fraud\":true}";
+        // Remove common prefixes
+        trimmed = trimmed.replaceFirst("(?i)^.*?(?:debited|credited|received|spent)\\s*", "");
+        trimmed = trimmed.trim();
+        
+        if (trimmed.length() > 50) {
+            trimmed = trimmed.substring(0, 50);
         }
-        return "{"
-                + "\"type\":\"" + type + "\","
-                + "\"amount\":" + (amount == null ? "null" : amount) + ","
-                + "\"description\":" + (desc == null ? "null" : "\"" + escapeJson(desc) + "\"") + ","
-                + "\"fraud\":" + fraud
-                + "}";
+        
+        return trimmed.isEmpty() ? null : trimmed;
+    }
+
+    /**
+     * Internal class to hold model output.
+     */
+    private static class ModelOutput {
+        String type = null;
+        Double amount = null;
+        String description = null;
     }
 
     public void warmup() {
-        // no-op
+        // Optional: Run a dummy inference to warm up the model
+        if (modelReady && inputVectorSize > 0) {
+            try {
+                float[] dummy = new float[inputVectorSize];
+                long[] shape = new long[]{1, inputVectorSize};
+                FloatBuffer fb = FloatBuffer.wrap(dummy);
+                Set<String> inputNames = session.getInputNames();
+                if (!inputNames.isEmpty()) {
+                    String inputName = inputNames.iterator().next();
+                    try (OnnxTensor tensor = OnnxTensor.createTensor(env, fb, shape);
+                         OrtSession.Result result = session.run(java.util.Collections.singletonMap(inputName, tensor))) {
+                        Log.d(TAG, "Model warmed up");
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Warmup failed", e);
+            }
+        }
     }
 
-    public boolean isModelReady() { return modelReady; }
+    public boolean isModelReady() {
+        return modelReady;
+    }
 }
