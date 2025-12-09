@@ -72,13 +72,9 @@ public class GenerativeModelHelper {
         Log.d(TAG, "🔍 TFLITE_MODEL: Initializing TensorFlow Lite model...");
         try {
             ByteBuffer modelBuffer = loadModelFile();
-            Interpreter.Options options = new Interpreter.Options();
-            // Set number of threads for inference
-            options.setNumThreads(4);
-            // Enable NNAPI delegate if available (for better performance)
-            // options.setUseNNAPI(true);
-            
-            tfliteInterpreter = new Interpreter(modelBuffer, options);
+            // Create Interpreter without Options to avoid InterpreterApi dependency issue
+            // Default settings will be used (single thread, no delegates)
+            tfliteInterpreter = new Interpreter(modelBuffer);
             Log.d(TAG, "🔍 TFLITE_MODEL: ✅ Model loaded successfully");
             modelReady = true;
         } catch (IllegalArgumentException e) {

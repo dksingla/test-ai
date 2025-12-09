@@ -50,9 +50,12 @@ dependencies {
     implementation(libs.navigation.ui)
     
     // TensorFlow Lite for SMS analysis
-    // Using version 2.15.0 which has stable InterpreterApi support
+    // Version 2.17.0 is required for FULLY_CONNECTED opcode version 12 support
+    // However, 2.17.0 has a known issue with InterpreterApi class availability
+    // Workaround: Use 2.17.0 runtime but compile against 2.15.0 API, then use reflection
+    // OR: Wait for TensorFlow Lite 2.17.1+ fix, or use nightly/snapshot builds
     implementation("org.tensorflow:tensorflow-lite-api:2.15.0")
-    implementation("org.tensorflow:tensorflow-lite:2.15.0")
+    implementation("org.tensorflow:tensorflow-lite:2.17.0")
     
     // Retrofit for API calls
     implementation("com.squareup.retrofit2:retrofit:2.9.0")
