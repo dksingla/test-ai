@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.FloatBuffer;
 import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
 
 import ai.onnxruntime.OnnxTensor;
 import ai.onnxruntime.OrtEnvironment;
@@ -28,6 +29,8 @@ public class GenerativeModelHelper {
     private OrtSession sessionType;
     private OrtSession sessionFraud;
     private volatile boolean modelReady = false;
+    private volatile boolean isLoading = false;
+    private ModelStatusCallback pendingCallback = null;
 
     public interface ModelStatusCallback {
         void onStatusChecked(int status);
@@ -49,8 +52,12 @@ public class GenerativeModelHelper {
     }
 
     private void initializeModels() {
-        Executor executor = ContextCompat.getMainExecutor(context);
-        executor.execute(() -> {
+        isLoading = true;
+        // Use background thread to avoid blocking UI thread (prevents ANR)
+        Executor backgroundExecutor = Executors.newSingleThreadExecutor();
+        Executor mainExecutor = ContextCompat.getMainExecutor(context);
+        
+        backgroundExecutor.execute(() -> {
             try {
                 env = OrtEnvironment.getEnvironment();
 
@@ -61,11 +68,33 @@ public class GenerativeModelHelper {
                 sessionFraud = env.createSession(modelFraudBytes);
 
                 modelReady = true;
+                isLoading = false;
                 Log.d(TAG, "✅ ONNX models loaded");
+                
+                // Notify pending callback on main thread if any
+                if (pendingCallback != null) {
+                    ModelStatusCallback callback = pendingCallback;
+                    pendingCallback = null;
+                    mainExecutor.execute(() -> {
+                        callback.onStatusChecked(1); // available
+                        callback.onModelReady();
+                    });
+                }
 
             } catch (Exception e) {
                 Log.e(TAG, "Failed to load ONNX models", e);
                 modelReady = false;
+                isLoading = false;
+                
+                // Notify pending callback of failure on main thread
+                if (pendingCallback != null) {
+                    ModelStatusCallback callback = pendingCallback;
+                    pendingCallback = null;
+                    mainExecutor.execute(() -> {
+                        callback.onStatusChecked(2); // unavailable
+                        callback.onDownloadFailed("Failed to load ONNX models: " + e.getMessage());
+                    });
+                }
             }
         });
     }
@@ -89,9 +118,16 @@ public class GenerativeModelHelper {
 
     public void checkAndPrepareModel(ModelStatusCallback callback) {
         if (modelReady) {
+            // Models are ready
             callback.onStatusChecked(1); // available
             callback.onModelReady();
+        } else if (isLoading) {
+            // Models are still loading, store callback to notify when done
+            pendingCallback = callback;
+            callback.onStatusChecked(0); // loading
+            Log.d(TAG, "Models are loading, callback will be notified when ready");
         } else {
+            // Models failed to load or not started
             callback.onStatusChecked(2); // unavailable
             callback.onDownloadFailed("ONNX models not loaded");
         }
@@ -102,16 +138,21 @@ public class GenerativeModelHelper {
      * If model predicts 'none' type => returns nulls + fraud=true.
      */
     public void generateContent(String smsText, ContentGenerationCallback callback) {
+        // Safety check: Never process if model is not ready
+        if (!modelReady) {
+            callback.onFailure("Model still loading, try again");
+            return;
+        }
+        
         Executor executor = ContextCompat.getMainExecutor(context);
         executor.execute(() -> {
             try {
                 // Compute features exactly like training script
                 float[] features = computeFeatures(smsText); // length = 6
 
-                // If models not ready -> fallback heuristics (simple)
-                if (!modelReady || sessionType == null || sessionFraud == null) {
-                    String fallback = fallbackResponseBasedOnHeuristics(smsText);
-                    callback.onSuccess(fallback);
+                // Double-check models are ready (defensive programming)
+                if (sessionType == null || sessionFraud == null) {
+                    callback.onFailure("Model sessions not initialized");
                     return;
                 }
 

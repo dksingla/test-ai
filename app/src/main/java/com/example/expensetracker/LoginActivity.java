@@ -29,6 +29,7 @@ public class LoginActivity extends AppCompatActivity {
     private ActivityLoginBinding binding;
     private boolean isLoading = false;
     private boolean isAnalyzingSms = false;
+    private boolean isModelReady = false;
     private GenerativeModelHelper generativeModelHelper;
 
     @Override
@@ -75,6 +76,7 @@ public class LoginActivity extends AppCompatActivity {
                 @Override
                 public void onDownloadFailed(String error) {
                     Log.e(TAG, "Model initialization failed: " + error);
+                    isModelReady = false;
                     // Show user-friendly error message
                     Toast.makeText(LoginActivity.this, "AI model failed to load: " + error, Toast.LENGTH_LONG).show();
                     // Disable SMS analysis button if model is not available
@@ -85,6 +87,7 @@ public class LoginActivity extends AppCompatActivity {
                 @Override
                 public void onModelReady() {
                     Log.d(TAG, "Model is ready");
+                    isModelReady = true;
                     binding.analyzeSmsButton.setEnabled(true);
                 }
             });
@@ -228,8 +231,8 @@ public class LoginActivity extends AppCompatActivity {
             return;
         }
         
-        // Check if model is ready
-        if (!generativeModelHelper.isModelReady()) {
+        // ✅ SAFE TO CALL MODEL NOW - Only call after onModelReady() fires
+        if (!isModelReady || !generativeModelHelper.isModelReady()) {
             Toast.makeText(this, "AI model is not ready. Please wait.", Toast.LENGTH_LONG).show();
             return;
         }
