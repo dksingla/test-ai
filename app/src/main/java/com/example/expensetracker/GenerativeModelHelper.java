@@ -42,7 +42,7 @@ public class GenerativeModelHelper {
     private Interpreter tfliteInterpreter;
     private Context context;
     private boolean modelReady = false;
-    private SimpleTokenizer tokenizer;
+    private Tokenizer tokenizer;
     
     public interface ModelStatusCallback {
         void onStatusChecked(int status);
@@ -61,7 +61,7 @@ public class GenerativeModelHelper {
     public GenerativeModelHelper(Context context) {
         Log.d(TAG, "🔍 TFLITE_MODEL: GenerativeModelHelper constructor called");
         this.context = context;
-        this.tokenizer = new SimpleTokenizer();
+        this.tokenizer = new Tokenizer(context);
         initializeModel();
     }
     
@@ -165,6 +165,11 @@ public class GenerativeModelHelper {
             return;
         }
         
+        if (!tokenizer.isInitialized()) {
+            callback.onFailure("Tokenizer failed to load. Please check tokenizer.json in assets.");
+            return;
+        }
+        
         Log.d(TAG, "🔍 TFLITE_MODEL: Analyzing SMS text: " + textPrompt);
         
         try {
@@ -181,16 +186,17 @@ public class GenerativeModelHelper {
             // Preprocess SMS text
             int[] inputSequence = preprocessText(smsText);
             Log.d(TAG, "🔍 TFLITE_MODEL: Preprocessed sequence length: " + inputSequence.length);
+            Log.d(TAG, "🔍 TFLITE_MODEL: Preprocessed sequence: " + Arrays.toString(inputSequence));
             
             // Prepare input/output buffers
-            // Model expects FLOAT32 input, not INT32
-            float[][] inputBuffer = new float[1][MAX_SEQUENCE_LENGTH];
+            // Model expects INT32 input for Embedding layer
+            int[][] inputBuffer = new int[1][MAX_SEQUENCE_LENGTH];
             float[][] typeOutput = new float[1][1];
             float[][] amountOutput = new float[1][1];
             
-            // Copy sequence to input buffer, converting int to float
+            // Copy sequence to input buffer (INT32)
             for (int i = 0; i < Math.min(inputSequence.length, MAX_SEQUENCE_LENGTH); i++) {
-                inputBuffer[0][i] = (float) inputSequence[i];
+                inputBuffer[0][i] = inputSequence[i];
             }
             
             // Run inference
@@ -324,8 +330,8 @@ public class GenerativeModelHelper {
             Log.d(TAG, "🔍 TFLITE_MODEL: Warming up model...");
             try {
                 // Run a dummy inference to warm up
-                // Use FLOAT32 to match model input type
-                float[][] dummyInput = new float[1][MAX_SEQUENCE_LENGTH];
+                // Use INT32 to match model input type (Embedding layer)
+                int[][] dummyInput = new int[1][MAX_SEQUENCE_LENGTH];
                 float[][] dummyTypeOutput = new float[1][1];
                 float[][] dummyAmountOutput = new float[1][1];
                 
@@ -342,40 +348,89 @@ public class GenerativeModelHelper {
     }
     
     /**
-     * Simple tokenizer implementation
-     * Note: This is a basic implementation. For best results, use the exact tokenizer
-     * vocabulary from training, but this should work reasonably well.
+     * Tokenizer implementation that loads word_index from tokenizer.json
+     * Uses the exact vocabulary from Python Keras tokenizer training
      */
-    private static class SimpleTokenizer {
+    private class Tokenizer {
+        private static final String TAG = "Tokenizer";
+        private static final String TOKENIZER_FILE = "tokenizer.json";
         private static final Pattern WORD_PATTERN = Pattern.compile("\\b\\w+\\b");
-        private static final Map<String, Integer> wordToIndex = new HashMap<>();
-        private static final int UNKNOWN_TOKEN_ID = 1; // OOV token
+        private Map<String, Integer> wordToIndex = new HashMap<>();
+        private final int OOV_TOKEN_ID = 1; // <OOV> token ID from tokenizer.json
+        private boolean initialized = false;
+        private Context context;
         
-        static {
-            // Initialize with common words (this is a simplified version)
-            // In production, you should load the actual tokenizer vocabulary
-            initializeCommonWords();
+        public Tokenizer(Context context) {
+            this.context = context;
+            loadTokenizer();
         }
         
-        private static void initializeCommonWords() {
-            // Add common banking/transaction words
-            String[] commonWords = {
-                "rs", "inr", "rupees", "paid", "received", "credit", "debit",
-                "account", "balance", "transaction", "upi", "bank", "to", "from",
-                "ref", "id", "avail", "bal", "amt", "amount", "date", "time"
-            };
-            
-            int index = 2; // Start from 2 (0 is padding, 1 is OOV)
-            for (String word : commonWords) {
-                wordToIndex.put(word.toLowerCase(), index++);
+        /**
+         * Load tokenizer.json from assets and parse word_index
+         */
+        private void loadTokenizer() {
+            try {
+                Log.d(TAG, "Loading tokenizer from assets: " + TOKENIZER_FILE);
+                InputStream inputStream = context.getAssets().open(TOKENIZER_FILE);
+                
+                // Read entire file
+                ByteArrayOutputStream byteBuffer = new ByteArrayOutputStream();
+                byte[] buffer = new byte[1024];
+                int len;
+                while ((len = inputStream.read(buffer)) != -1) {
+                    byteBuffer.write(buffer, 0, len);
+                }
+                inputStream.close();
+                
+                String jsonString = byteBuffer.toString("UTF-8");
+                Log.d(TAG, "Tokenizer JSON loaded, size: " + jsonString.length() + " bytes");
+                
+                // Parse JSON
+                JSONObject tokenizerJson = new JSONObject(jsonString);
+                JSONObject config = tokenizerJson.getJSONObject("config");
+                
+                // word_index is stored as a JSON string inside config, so we need to parse it again
+                String wordIndexJsonString = config.getString("word_index");
+                JSONObject wordIndexJson = new JSONObject(wordIndexJsonString);
+                
+                // Build wordToIndex map
+                wordToIndex.clear();
+                java.util.Iterator<String> keys = wordIndexJson.keys();
+                while (keys.hasNext()) {
+                    String word = keys.next();
+                    int index = wordIndexJson.getInt(word);
+                    wordToIndex.put(word.toLowerCase(), index);
+                }
+                
+                initialized = true;
+                Log.d(TAG, "✅ Tokenizer loaded successfully. Vocabulary size: " + wordToIndex.size());
+                Log.d(TAG, "OOV token ID: " + OOV_TOKEN_ID);
+                
+            } catch (IOException e) {
+                Log.e(TAG, "❌ Failed to load tokenizer.json from assets", e);
+                initialized = false;
+            } catch (Exception e) {
+                Log.e(TAG, "❌ Failed to parse tokenizer.json", e);
+                initialized = false;
             }
         }
         
+        /**
+         * Convert text to sequence of token IDs
+         * Matches Keras Tokenizer behavior: lowercase, split by space, filter punctuation
+         */
         public List<Integer> textsToSequences(String text) {
+            if (!initialized) {
+                Log.w(TAG, "Tokenizer not initialized, using OOV token");
+                return Arrays.asList(OOV_TOKEN_ID);
+            }
+            
             List<Integer> sequences = new ArrayList<>();
+            
+            // Preprocess text: lowercase and split by space (matching Keras tokenizer config)
             String lowerText = text.toLowerCase();
             
-            // Extract words
+            // Extract words using regex (matches word boundaries)
             java.util.regex.Matcher matcher = WORD_PATTERN.matcher(lowerText);
             while (matcher.find()) {
                 String word = matcher.group();
@@ -384,15 +439,20 @@ public class GenerativeModelHelper {
                 if (tokenId != null) {
                     sequences.add(tokenId);
                 } else {
-                    // Use hash-based tokenization for unknown words
-                    // This ensures consistent tokenization
-                    int hashToken = Math.abs(word.hashCode() % VOCAB_SIZE);
-                    if (hashToken == 0) hashToken = UNKNOWN_TOKEN_ID;
-                    sequences.add(hashToken);
+                    // Word not in vocabulary - use OOV token
+                    sequences.add(OOV_TOKEN_ID);
+                    Log.v(TAG, "OOV word: " + word);
                 }
             }
             
             return sequences;
+        }
+        
+        /**
+         * Check if tokenizer is initialized
+         */
+        public boolean isInitialized() {
+            return initialized;
         }
     }
     
